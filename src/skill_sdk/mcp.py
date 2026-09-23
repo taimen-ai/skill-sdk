@@ -2,7 +2,7 @@
 
 Имя инструмента — имя скилла (``implementation.entrypoint`` контракта). Успех —
 ``structuredContent`` = outputs и тот же JSON текстовым блоком для клиентов без
-structured content; cost — в ``_meta["ai.taimen/cost"]``. ``SkillError`` —
+structured content; cost — в ``_meta["skill/cost"]``. ``SkillError`` —
 ``isError`` с единственным текстовым блоком ``{"error": {code, message, retryable,
 details}}``: по нему исполнитель узнаёт код и повторяемость.
 
@@ -23,7 +23,7 @@ from skill_sdk.errors import SkillError, from_exception
 from skill_sdk.skill import Skill
 
 logger = logging.getLogger("skill_sdk.mcp")
-COST_META = "ai.taimen/cost"
+COST_META = "skill/cost"
 
 
 def _tools(skills: Iterable[Skill]) -> dict[str, Skill]:

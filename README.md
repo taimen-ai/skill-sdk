@@ -96,7 +96,7 @@ LLM: по умолчанию `OpenAICompatibleClient` из `SKILL_LLM_BASE_URL`,
 |---|---|---|
 | `local` | пакет установлен рядом с демоном, `CONTROL_PLANE_SKILLS_LOCAL_PACKAGES=<пакет>` | исполнитель находит скиллы SDK сам, вызывает `__skill_invoke__` и получает `{outputs, cost}` |
 | `http` | `skill-sdk serve http my_skills` или `skill_sdk.http.create_app(...)` в своём ASGI | `POST /skills/{name}@{version}`; 200 — outputs, cost — в `X-Skill-Cost`; ошибка — `{"error": {code, retryable, …}}` |
-| `mcp` | `skill-sdk serve mcp-stdio` или `mcp-http` | инструмент с именем скилла; cost — в `_meta["ai.taimen/cost"]`; ошибка — `isError` с тем же `{"error": …}` |
+| `mcp` | `skill-sdk serve mcp-stdio` или `mcp-http` | инструмент с именем скилла; cost — в `_meta["skill/cost"]`; ошибка — `isError` с тем же `{"error": …}` |
 
 `http` и `mcp-http` проверяют IAM-токен audience скилла через `platform-auth-sdk`
 (`SKILL_SDK_IAM_ISSUER`, `SKILL_SDK_AUDIENCE`, `SKILL_SDK_JWKS_URL`). Без проверки
