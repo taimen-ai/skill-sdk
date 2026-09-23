@@ -1,0 +1,110 @@
+"""Скиллы в пакете каталога Control Plane (TAI-ADR-0044, TAI-ADR-0045 п.2).
+
+Источник истины контракта — код. YAML ``kind: Skill`` в ``packages/<пакет>/skills/``
+генерируется отсюда, а ``--check`` в CI ловит расхождение кода и файла.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from skill_sdk.skill import Implementation, Skill
+
+API_VERSION = "taimen.ai/v1"
+FOLDER = "skills"
+
+
+def document(skill: Skill, implementation: Implementation | None = None) -> dict[str, Any]:
+    return {
+        "apiVersion": API_VERSION,
+        "kind": "Skill",
+        "key": skill.name,
+        "spec": skill.spec(implementation),
+    }
+
+
+class _Dumper(yaml.SafeDumper):  # type: ignore[misc]  # у PyYAML нет типов
+    pass
+
+
+def _str(dumper: yaml.SafeDumper, data: str) -> Any:
+    return dumper.represent_scalar(
+        "tag:yaml.org,2002:str", data, style="|" if "\n" in data else None
+    )
+
+
+_Dumper.add_representer(str, _str)
+
+
+def _schema_comment(target: Path) -> str:
+    """Строка ``yaml-language-server`` на схему формата, если пакет лежит в дереве ``packages/``."""
+    for parent in target.parents:
+        schema = parent / "schema" / "v1" / "object.schema.json"
+        if schema.exists():
+            return f"# yaml-language-server: $schema={os.path.relpath(schema, target.parent)}\n"
+    return ""
+
+
+def render(skill: Skill, target: Path, implementation: Implementation | None = None) -> str:
+    header = (
+        _schema_comment(target)
+        + "# Сгенерировано skill-sdk из кода — правьте код и перегенерируйте (TAI-ADR-0045).\n"
+    )
+    body: str = yaml.dump(
+        document(skill, implementation),
+        Dumper=_Dumper,
+        allow_unicode=True,
+        sort_keys=False,
+        width=100,
+    )
+    return header + body
+
+
+def path_for(package: Path, skill: Skill) -> Path:
+    return package / FOLDER / f"{skill.name}.yaml"
+
+
+def export(
+    skills: Iterable[Skill], package: Path, implementation: Implementation | None = None
+) -> list[Path]:
+    written = []
+    for item in skills:
+        target = path_for(package, item)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(render(item, target, implementation), encoding="utf-8")
+        written.append(target)
+    return written
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+
+def drift(
+    skills: Iterable[Skill], package: Path, implementation: Implementation | None = None
+) -> list[str]:
+    """Расхождения кода и файлов пакета; пустой список — совпадают."""
+    problems = []
+    for item in skills:
+        target = path_for(package, item)
+        if not target.exists():
+            problems.append(f"{item.ref}: нет файла {target}")
+            continue
+        current = yaml.safe_load(target.read_text(encoding="utf-8"))
+        wanted = document(item, implementation)
+        if _canonical(current) != _canonical(wanted):
+            fields = [
+                k
+                for k in wanted["spec"]
+                if _canonical((current.get("spec") or {}).get(k)) != _canonical(wanted["spec"][k])
+            ]
+            problems.append(
+                f"{item.ref}: {target} расходится с кодом ({', '.join(fields) or 'обёртка'})"
+            )
+    return problems
