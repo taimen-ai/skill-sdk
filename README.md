@@ -1,14 +1,16 @@
+*English. Russian version: [README.ru.md](README.ru.md)*
+
 # skill-sdk
 
-SDK скиллов платформы Taimen. Скилл пишется один раз в коде, а SDK даёт всё
-остальное:
+The skill SDK of the Taimen platform. A skill is written once, in code, and the
+SDK provides everything else:
 
-- контракт v1 (CP-ADR-0056);
-- контекст вызова;
-- хостинг по всем трём протоколам исполнителя — `local`, `http`, `mcp`;
-- YAML для пакета каталога (TAI-ADR-0044).
+- the v1 contract (CP-ADR-0056);
+- the invocation context;
+- hosting over all three executor protocols — `local`, `http`, `mcp`;
+- the YAML for a catalog package (TAI-ADR-0044).
 
-Решение — TAI-ADR-0045 суперпроекта.
+The decision is TAI-ADR-0045 of the superproject.
 
 ```python
 from typing import Literal
@@ -40,88 +42,90 @@ class MergeOut(BaseModel):
     retry=(3, 30),
 )
 def merge(inputs: MergeIn, ctx: SkillContext) -> MergeOut:
-    """Влить опубликованную ветку в целевую."""
+    """Merge a published branch into the target branch."""
     ...
     if conflict:
-        return MergeOut(merged=False, reason="conflict")  # исход контракта — это выход
-    raise SkillError("git_unavailable", "remote недоступен", retryable=True)  # сбой — ошибка
+        return MergeOut(merged=False, reason="conflict")  # a contract outcome is an output
+    raise SkillError("git_unavailable", "remote unavailable", retryable=True)  # a failure is an error
 ```
 
-## Контракт — из кода
+## The contract comes from code
 
-- **Вход и выход** берутся из моделей pydantic в аннотациях: первый аргумент и
-  возвращаемое значение. Если модель не подходит (например, у уже опубликованной
-  версии своя JSON Schema), схему можно задать явно через `inputs_schema=` и
-  `outputs_schema=`.
-- **Политика** — из аргументов декоратора: `side_effects` (`none`,
-  `external_read` или `external_write`), `risk`, `idempotency`, `timeout`,
+- **Inputs and outputs** come from the pydantic models in the annotations: the
+  first argument and the return value. When a model does not fit (for example, an
+  already published version has its own JSON Schema), pass the schema explicitly
+  with `inputs_schema=` and `outputs_schema=`.
+- **Policy** comes from the decorator arguments: `side_effects` (`none`,
+  `external_read` or `external_write`), `risk`, `idempotency`, `timeout`,
   `retry=(maxAttempts, backoffSeconds)`, `permissions`, `preconditions`,
   `postconditions`, `cost_model`.
-- **Описание** — первый абзац docstring.
-- **Реализация по умолчанию** — `local` с entrypoint `модуль:имя` самой функции.
-  Для `http` и `mcp` её задают при экспорте: как хостить — решение инсталляции.
+- **Description** is the first paragraph of the docstring.
+- **Default implementation** is `local` with the entrypoint `module:name` of the
+  function itself. `http` and `mcp` are set at export: how to host is a decision of
+  the installation.
 
-SDK отвергает то, что отвергло бы ядро, ещё при импорте. Например,
-`external_write` без идемпотентности с повторами.
+The SDK rejects at import time what the core would reject, for example
+`external_write` with retries but without idempotency.
 
-## Вызов
+## Invocation
 
-Функция принимает `(inputs)` или `(inputs, ctx)`, может быть синхронной или
-`async`. SDK проверяет вход по схеме контракта, передаёт модель, проверяет выход
-и сериализует его. Нарушение контракта даёт `input_contract_violation` или
-`output_contract_violation`.
+The function takes `(inputs)` or `(inputs, ctx)` and may be synchronous or
+`async`. The SDK validates the input against the contract schema, passes the
+model, validates the output and serializes it. A contract violation is
+`input_contract_violation` or `output_contract_violation`.
 
 `SkillContext`:
 
 | | |
 |---|---|
-| `ctx.invocation_id`, `ctx.idempotency_key` | какой это вызов; повтор с тем же ключом не должен дать второй внешний эффект |
-| `ctx.remaining()`, `ctx.check_deadline()` | сколько осталось до таймаута контракта |
-| `ctx.log` | журнал с id вызова |
-| `ctx.config(name)`, `ctx.secret(name)` | параметры и секреты хостинга; нет секрета — повторяемый `config_missing` |
-| `ctx.llm` | клиент `platform-llm` по конфигурации инсталляции; токены учитываются сами |
-| `ctx.add_cost(unit, amount)` | своё потребление; уходит в `cost` вызова вместе с токенами LLM |
-| `ctx.caller` | проверенный контекст вызывающего (http) |
+| `ctx.invocation_id`, `ctx.idempotency_key` | which invocation this is; a retry with the same key must not cause a second external effect |
+| `ctx.remaining()`, `ctx.check_deadline()` | time left until the contract timeout |
+| `ctx.log` | a logger carrying the invocation id |
+| `ctx.config(name)`, `ctx.secret(name)` | hosting parameters and secrets; a missing secret is a retryable `config_missing` |
+| `ctx.llm` | a `platform-llm` client configured by the installation; tokens are counted automatically |
+| `ctx.add_cost(unit, amount)` | the skill's own consumption; goes into the invocation `cost` together with LLM tokens |
+| `ctx.caller` | the verified caller context (http) |
 
-Клиента Control Plane в контексте нет намеренно: скилл не заводит и не двигает
-задачи. Это делают исходы approval и правила ядра (TAI-ADR-0041).
+There is deliberately no Control Plane client in the context: a skill does not
+create or move tasks. Approval outcomes and core rules do that (TAI-ADR-0041).
 
-LLM: по умолчанию `OpenAICompatibleClient` из `SKILL_LLM_BASE_URL`,
-`SKILL_LLM_API_KEY`, `SKILL_LLM_MODELS` (через запятую). Другой провайдер
-задаётся через `skill_sdk.configure_llm(factory)`.
+LLM: by default `OpenAICompatibleClient` from `SKILL_LLM_BASE_URL`,
+`SKILL_LLM_API_KEY`, `SKILL_LLM_MODELS` (comma-separated). Another provider is set
+with `skill_sdk.configure_llm(factory)`.
 
-## Хостинг
+## Hosting
 
-| Протокол | Как | Что видит исполнитель |
+| Protocol | How | What the executor sees |
 |---|---|---|
-| `local` | пакет установлен рядом с демоном, `CONTROL_PLANE_SKILLS_LOCAL_PACKAGES=<пакет>` | исполнитель находит скиллы SDK сам, вызывает `__skill_invoke__` и получает `{outputs, cost}` |
-| `http` | `skill-sdk serve http my_skills` или `skill_sdk.http.create_app(...)` в своём ASGI | `POST /skills/{name}@{version}`; 200 — outputs, cost — в `X-Skill-Cost`; ошибка — `{"error": {code, retryable, …}}` |
-| `mcp` | `skill-sdk serve mcp-stdio` или `mcp-http` | инструмент с именем скилла; cost — в `_meta["skill/cost"]`; ошибка — `isError` с тем же `{"error": …}` |
+| `local` | the package is installed next to the daemon, `CONTROL_PLANE_SKILLS_LOCAL_PACKAGES=<package>` | the executor finds SDK skills itself, calls `__skill_invoke__` and gets `{outputs, cost}` |
+| `http` | `skill-sdk serve http my_skills` or `skill_sdk.http.create_app(...)` in your own ASGI app | `POST /skills/{name}@{version}`; 200 — outputs, cost in `X-Skill-Cost`; an error is `{"error": {code, retryable, …}}` |
+| `mcp` | `skill-sdk serve mcp-stdio` or `mcp-http` | a tool named after the skill; cost in `_meta["skill/cost"]`; an error is `isError` with the same `{"error": …}` |
 
-`http` и `mcp-http` проверяют IAM-токен audience скилла через `platform-auth-sdk`
-(`SKILL_SDK_IAM_ISSUER`, `SKILL_SDK_AUDIENCE`, `SKILL_SDK_JWKS_URL`). Без проверки
-хостинг не стартует — только с явным `--allow-anonymous` для разработки.
+`http` and `mcp-http` verify an IAM token of the skill's audience through
+`platform-auth-sdk` (`SKILL_SDK_IAM_ISSUER`, `SKILL_SDK_AUDIENCE`,
+`SKILL_SDK_JWKS_URL`). Without verification hosting does not start, except with an
+explicit `--allow-anonymous` for development.
 
-## Пакет каталога
+## Catalog package
 
 ```bash
-skill-sdk export --package ../packages/selfdev taimen_selfdev           # записать skills/*.yaml
-skill-sdk export --package ../packages/selfdev --check taimen_selfdev   # CI: код == YAML
+skill-sdk export --package ../packages/selfdev taimen_selfdev           # write skills/*.yaml
+skill-sdk export --package ../packages/selfdev --check taimen_selfdev   # CI: code == YAML
 skill-sdk export --package ../packages/acme --protocol http \
-    --endpoint '${ACME_SKILLS_URL}' --audience acme-skills acme_skills  # хостинг по http
+    --endpoint '${ACME_SKILLS_URL}' --audience acme-skills acme_skills  # hosted over http
 ```
 
-YAML с пометкой «сгенерировано» руками не правится. Контракт версии в ядре
-неизменяем: изменение контракта означает новую `version` в декораторе.
+YAML marked as generated is never edited by hand. A version contract is immutable
+in the core: changing the contract means a new `version` in the decorator.
 
-## Тесты скилла
+## Testing a skill
 
 ```python
 from skill_sdk.testing import check_contract, invoke
 
 
 def test_merge_contract():
-    check_contract(merge)  # валидаторы ядра, если control-plane рядом
+    check_contract(merge)  # core validators, when control-plane is next to it
 
 
 def test_conflict_is_an_outcome():
@@ -131,14 +135,19 @@ def test_conflict_is_an_outcome():
     assert result.outputs["reason"] == "conflict"
 ```
 
-## Установка
+## Installation
 
 ```bash
-uv add skill-sdk                    # контракт, local, тесты, экспорт
-uv add "skill-sdk[http]"            # + ASGI-хостинг и проверка токена
-uv add "skill-sdk[mcp]"             # + MCP-сервер
+uv add skill-sdk                    # contract, local, testing, export
+uv add "skill-sdk[http]"            # + ASGI hosting and token verification
+uv add "skill-sdk[mcp]"             # + MCP server
 uv add "skill-sdk[llm]"             # + ctx.llm
 ```
 
-`platform-auth-sdk` и `platform-llm` подключаются соседними папками (плоская
-раскладка суперпроекта). Тесты: `uv run pytest -q`.
+`platform-auth-sdk` and `platform-llm` are sibling folders (the flat layout of the
+superproject). Tests: `uv run pytest -q`.
+
+## Licence
+
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Third-party
+components are listed in [THIRD_PARTY.md](THIRD_PARTY.md) (`sbom.json`, CycloneDX).
