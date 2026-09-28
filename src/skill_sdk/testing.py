@@ -121,28 +121,36 @@ class FakeKnowledge:
     def _entities(snapshot: Mapping[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for entity in snapshot.get("entities") or []:
-            key = f"{entity.get('kind')}:{entity.get('key') or entity.get('naturalKey')}"
-            out[key] = {k: v for k, v in entity.items() if k not in ("kind",)}
+            ident = f"{entity.get('kind')}\x1f{entity.get('key') or entity.get('naturalKey')}"
+            out[ident] = {k: v for k, v in entity.items() if k not in ("kind",)}
         return out
 
     def _plan(self, snapshot: Mapping[str, Any], workspace_id: str) -> dict[str, Any]:
+        """Ответ сверки в форме памяти (MEM-ADR-020): изменившийся элемент считается и
+        закрытым, и открытым (``superseded``); ``changes`` — ключи ``{kind, key}``."""
         current = self.state.get(self._slot(snapshot, workspace_id), {})
         wanted = self._entities(snapshot)
         opened = [k for k in wanted if k not in current]
         closed = [k for k in current if k not in wanted]
         changed = [k for k in wanted if k in current and current[k] != wanted[k]]
         unchanged = len(wanted) - len(opened) - len(changed)
+
+        def refs(idents: list[str]) -> list[dict[str, str]]:
+            return [dict(zip(("kind", "key"), i.split("\x1f", 1), strict=True)) for i in idents]
+
         return {
-            "opened": len(opened),
-            "changed": len(changed),
-            "closed": len(closed),
+            "opened": len(opened) + len(changed),
+            "closed": len(closed) + len(changed),
+            "superseded": len(changed),
             "unchanged": unchanged,
-            "changes": (
-                [{"op": "open", "key": k} for k in opened]
-                + [{"op": "change", "key": k} for k in changed]
-                + [{"op": "close", "key": k} for k in closed]
-            ),
-            "conflicts": [],
+            "changes": {
+                "opened": refs(opened),
+                "changed": refs(changed),
+                "closed": refs(closed),
+                "limit": 1000,
+                "truncated": False,
+            },
+            "conflicts": {"items": [], "limit": 1000, "truncated": False},
             "stateToken": _fingerprint(current),
         }
 
@@ -161,7 +169,7 @@ class FakeKnowledge:
             raise SnapshotStale(state_token=plan["stateToken"])
         self.state[self._slot(snapshot, workspace_id)] = self._entities(snapshot)
         self.applied.append(dict(snapshot))
-        return {k: plan[k] for k in ("opened", "changed", "closed", "unchanged")}
+        return {**plan, "stateToken": _fingerprint(self.state[self._slot(snapshot, workspace_id)])}
 
     async def document(
         self, *, workspace_id: str, natural_key: str, **fields: Any
