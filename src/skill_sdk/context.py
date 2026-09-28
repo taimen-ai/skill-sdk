@@ -21,6 +21,7 @@ from typing import Any
 
 from skill_sdk.core import Artifacts, Core, Knowledge, core_for
 from skill_sdk.errors import SkillError
+from skill_sdk.pii import redact_messages
 
 logger = logging.getLogger("skill_sdk")
 
@@ -114,11 +115,32 @@ class _LlmUsage:
 
 
 class _MeteredLlm:
-    """Тот же ``StructuredChatClient``, но каждый ответ учитывается в cost вызова."""
+    """Тот же ``StructuredChatClient``, но каждый ответ учитывается в cost вызова, а
+    промпт проходит страж персональных данных (``skill_sdk.pii``, TAI-ADR-0056 Р13)."""
 
-    def __init__(self, inner: Any, usage: _LlmUsage) -> None:
+    def __init__(self, inner: Any, usage: _LlmUsage, log: Any = None) -> None:
         self._inner = inner
         self._usage = usage
+        self._log = log or logger
+
+    def _guard(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        system_prompt = kwargs.get("system_prompt")
+        messages = kwargs.get("messages")
+        if not isinstance(system_prompt, str) and not isinstance(messages, list):
+            return kwargs
+        system, clean, found = redact_messages(
+            system_prompt if isinstance(system_prompt, str) else "",
+            messages if isinstance(messages, list) else [],
+        )
+        if found:
+            # только виды и счёт — значения в журнал не попадают
+            self._log.warning("персональные данные заменены в промпте LLM: %s", found.as_log())
+        guarded = dict(kwargs)
+        if isinstance(system_prompt, str):
+            guarded["system_prompt"] = system
+        if isinstance(messages, list):
+            guarded["messages"] = clean
+        return guarded
 
     def _record(self, result: Any) -> Any:
         usage = self._usage
@@ -138,10 +160,10 @@ class _MeteredLlm:
         return result
 
     async def chat_json(self, **kwargs: Any) -> Any:
-        return self._record(await self._inner.chat_json(**kwargs))
+        return self._record(await self._inner.chat_json(**self._guard(kwargs)))
 
     async def chat_json_object(self, **kwargs: Any) -> Any:
-        return self._record(await self._inner.chat_json_object(**kwargs))
+        return self._record(await self._inner.chat_json_object(**self._guard(kwargs)))
 
     async def aclose(self) -> None:
         await self._inner.aclose()
@@ -215,10 +237,13 @@ class SkillContext:
 
     @property
     def llm(self) -> Any:
-        """LLM-клиент инсталляции (``platform_llm.StructuredChatClient``) с учётом токенов."""
+        """LLM-клиент инсталляции (``platform_llm.StructuredChatClient``) с учётом токенов.
+
+        Персональные данные в ``system_prompt`` и ``messages`` заменяются маркерами
+        до вызова модели (``skill_sdk.pii``)."""
         if self._llm is None:
             factory = _llm_factory or _default_llm
-            self._llm = _MeteredLlm(factory(), self._llm_usage)
+            self._llm = _MeteredLlm(factory(), self._llm_usage, self.log)
         return self._llm
 
     # -- ядро: артефакты и база знаний --
