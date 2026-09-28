@@ -4,7 +4,10 @@
 времени, куда писать журнал, во что обошёлся вызов, параметры и секреты
 инсталляции, LLM-клиент по конфигурации. Клиента Control Plane в контексте нет
 намеренно: скилл не заводит и не двигает задачи — это исходы approval и правила
-(TAI-ADR-0041), а результат скилла ядро само кладёт куда надо.
+(TAI-ADR-0041), а результат скилла ядро само кладёт куда надо. Есть только узкий
+доступ к ядру (TAI-ADR-0056 Р5): ``ctx.artifacts`` — содержимое артефактов,
+``ctx.knowledge`` — предпросмотр и применение снимка, документы и обход базы
+знаний (``skill_sdk.core``).
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from skill_sdk.core import Artifacts, Core, Knowledge, core_for
 from skill_sdk.errors import SkillError
 
 logger = logging.getLogger("skill_sdk")
@@ -153,6 +157,7 @@ class SkillContext:
         self._units: dict[str, float] = {}
         self._llm_usage = _LlmUsage()
         self._llm: _MeteredLlm | None = None
+        self._core: Core | None = None
         self.log = logging.LoggerAdapter(
             logger, {"skill": invocation.skill, "invocation_id": invocation.invocation_id}
         )
@@ -216,6 +221,23 @@ class SkillContext:
             self._llm = _MeteredLlm(factory(), self._llm_usage)
         return self._llm
 
+    # -- ядро: артефакты и база знаний --
+
+    def _core_access(self) -> Core:
+        if self._core is None:
+            self._core = core_for(self)
+        return self._core
+
+    @property
+    def artifacts(self) -> Artifacts:
+        """Содержимое артефактов через ядро учётной записью исполнителя скиллов."""
+        return self._core_access().artifacts
+
+    @property
+    def knowledge(self) -> Knowledge:
+        """База знаний через ядро: ``preview``, ``apply``, ``document``, ``recall``."""
+        return self._core_access().knowledge
+
     def cost(self) -> dict[str, Any] | None:
         """Документ ``cost`` для ``:complete`` — ``None``, если учитывать нечего."""
         document: dict[str, Any] = {}
@@ -238,3 +260,6 @@ class SkillContext:
     async def aclose(self) -> None:
         if self._llm is not None:
             await self._llm.aclose()
+        if self._core is not None:
+            core, self._core = self._core, None
+            await core.aclose()

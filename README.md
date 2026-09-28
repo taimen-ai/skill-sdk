@@ -85,6 +85,8 @@ model, validates the output and serializes it. A contract violation is
 | `ctx.llm` | an LLM client configured by the installation (`platform-llm` or Claude on a subscription); tokens are counted automatically |
 | `ctx.add_cost(unit, amount)` | the skill's own consumption; goes into the invocation `cost` together with LLM tokens |
 | `ctx.caller` | the verified caller context (http) |
+| `ctx.artifacts.read(id)` | artifact content through the core, with the skills executor's credential (`ArtifactContent`: `data`, `media_type`, `text()`) |
+| `ctx.knowledge` | the knowledge base through the core: `preview(snapshot, workspace_id=…)` — a plan without writing plus `stateToken`; `apply(snapshot, workspace_id=…, expected_state=…)` — apply only if the state has not changed, otherwise `SnapshotStale`; `document(…)` — a document with chunks and links; `recall(**query)` — typed traversal with `where` |
 
 There is deliberately no Control Plane client in the context: a skill does not
 create or move tasks. Approval outcomes and core rules do that (TAI-ADR-0041).
