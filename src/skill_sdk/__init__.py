@@ -18,10 +18,12 @@ async def summarize(inputs: Query, ctx: SkillContext) -> Answer:
 """
 
 from skill_sdk.context import Invocation, SkillContext, configure_llm
+from skill_sdk.core import ArtifactContent, SnapshotStale, configure_core
 from skill_sdk.errors import SkillError
 from skill_sdk.skill import Http, Local, Mcp, Skill, discover, skill
 
 __all__ = [
+    "ArtifactContent",
     "Http",
     "Invocation",
     "Local",
@@ -29,6 +31,8 @@ __all__ = [
     "Skill",
     "SkillContext",
     "SkillError",
+    "SnapshotStale",
+    "configure_core",
     "configure_llm",
     "discover",
     "skill",
