@@ -82,16 +82,40 @@ model, validates the output and serializes it. A contract violation is
 | `ctx.remaining()`, `ctx.check_deadline()` | time left until the contract timeout |
 | `ctx.log` | a logger carrying the invocation id |
 | `ctx.config(name)`, `ctx.secret(name)` | hosting parameters and secrets; a missing secret is a retryable `config_missing` |
-| `ctx.llm` | a `platform-llm` client configured by the installation; tokens are counted automatically |
+| `ctx.llm` | an LLM client configured by the installation (`platform-llm` or Claude on a subscription); tokens are counted automatically |
 | `ctx.add_cost(unit, amount)` | the skill's own consumption; goes into the invocation `cost` together with LLM tokens |
 | `ctx.caller` | the verified caller context (http) |
 
 There is deliberately no Control Plane client in the context: a skill does not
 create or move tasks. Approval outcomes and core rules do that (TAI-ADR-0041).
 
-LLM: by default `OpenAICompatibleClient` from `SKILL_LLM_BASE_URL`,
-`SKILL_LLM_API_KEY`, `SKILL_LLM_MODELS` (comma-separated). Another provider is set
-with `skill_sdk.configure_llm(factory)`.
+LLM: the provider is chosen by `SKILL_LLM_PROVIDER`. An arbitrary provider is set
+in code with `skill_sdk.configure_llm(factory)`.
+
+| `SKILL_LLM_PROVIDER` | What it is | Configuration |
+|---|---|---|
+| `openai` (default) | `platform_llm.OpenAICompatibleClient` — any OpenAI-compatible `/chat/completions` | `SKILL_LLM_BASE_URL`, `SKILL_LLM_API_KEY`, `SKILL_LLM_MODELS` (comma-separated) |
+| `claude-code` | Claude on a subscription through the Claude Code CLI (`claude -p`), as coding agents use it | `CLAUDE_CODE_OAUTH_TOKEN` in the environment, `SKILL_LLM_MODELS` (Claude aliases: `sonnet`, `claude-sonnet-5`…; empty — the CLI default), `SKILL_LLM_TIMEOUT_SECONDS` (300), `SKILL_LLM_CLAUDE_BINARY` (`claude`) |
+
+How `claude-code` works (`skill_sdk.claude_code.ClaudeCodeLlm`):
+
+- plain text completion: `--tools ""`, no MCP servers, no session persistence,
+  an empty temporary working directory;
+- the skill's system prompt, the messages and the response JSON schema (from the
+  pydantic model) are rendered into one prompt sent over **stdin**; argv carries
+  only a constant neutral system prompt;
+- the reply is `--output-format json`; JSON is taken from the model's text (as is,
+  from a ```` ```json ```` block or by braces) and validated against the response
+  model; on failure — one retry quoting the error, then the next model in the list,
+  then a retryable `llm_invalid_response`;
+- the CLI inherits the subscription token from the process environment; the SDK
+  never reads or logs it and redacts it from error text. `ANTHROPIC_API_KEY` and
+  `ANTHROPIC_AUTH_TOKEN` are not passed to the child, otherwise the call would go
+  through an API key rather than the subscription;
+- a subscription window limit or 429 is a retryable `llm_rate_limited` at once (the
+  limit is shared by all models); no CLI — `llm_unavailable`, timeout —
+  `llm_timeout`, any other CLI failure — `llm_failed`, all retryable;
+- `cost` gets the tokens; the CLI's notional price under a subscription is not spend.
 
 ## Hosting
 

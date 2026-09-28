@@ -81,16 +81,40 @@ SDK отвергает то, что отвергло бы ядро, ещё пр�
 | `ctx.remaining()`, `ctx.check_deadline()` | сколько осталось до таймаута контракта |
 | `ctx.log` | журнал с id вызова |
 | `ctx.config(name)`, `ctx.secret(name)` | параметры и секреты хостинга; нет секрета — повторяемый `config_missing` |
-| `ctx.llm` | клиент `platform-llm` по конфигурации инсталляции; токены учитываются сами |
+| `ctx.llm` | LLM-клиент по конфигурации инсталляции (`platform-llm` или Claude по подписке); токены учитываются сами |
 | `ctx.add_cost(unit, amount)` | своё потребление; уходит в `cost` вызова вместе с токенами LLM |
 | `ctx.caller` | проверенный контекст вызывающего (http) |
 
 Клиента Control Plane в контексте нет намеренно: скилл не заводит и не двигает
 задачи. Это делают исходы approval и правила ядра (TAI-ADR-0041).
 
-LLM: по умолчанию `OpenAICompatibleClient` из `SKILL_LLM_BASE_URL`,
-`SKILL_LLM_API_KEY`, `SKILL_LLM_MODELS` (через запятую). Другой провайдер
-задаётся через `skill_sdk.configure_llm(factory)`.
+LLM: провайдер выбирает `SKILL_LLM_PROVIDER`. Произвольный провайдер задаётся
+кодом через `skill_sdk.configure_llm(factory)`.
+
+| `SKILL_LLM_PROVIDER` | Что это | Настройка |
+|---|---|---|
+| `openai` (по умолчанию) | `platform_llm.OpenAICompatibleClient` — любой OpenAI-совместимый `/chat/completions` | `SKILL_LLM_BASE_URL`, `SKILL_LLM_API_KEY`, `SKILL_LLM_MODELS` (через запятую) |
+| `claude-code` | Claude по подписке через Claude Code CLI (`claude -p`) — как у кодовых агентов | `CLAUDE_CODE_OAUTH_TOKEN` в окружении, `SKILL_LLM_MODELS` (алиасы Claude: `sonnet`, `claude-sonnet-5`…; пусто — модель CLI по умолчанию), `SKILL_LLM_TIMEOUT_SECONDS` (300), `SKILL_LLM_CLAUDE_BINARY` (`claude`) |
+
+Как устроен `claude-code` (`skill_sdk.claude_code.ClaudeCodeLlm`):
+
+- чистое завершение текста: `--tools ""`, MCP-серверов нет, сессия не
+  сохраняется, рабочий каталог — пустой временный;
+- system prompt скилла, сообщения и JSON-схема ответа (из pydantic-модели)
+  сводятся в один промпт и идут через **stdin** — в argv только постоянный
+  нейтральный system prompt;
+- ответ — `--output-format json`; JSON берётся из текста модели (как есть,
+  из блока ```` ```json ```` или по фигурным скобкам) и проверяется моделью ответа;
+  не прошёл — одна повторная попытка с текстом ошибки, затем следующая модель
+  списка, затем повторяемый `llm_invalid_response`;
+- токен подписки CLI наследует из окружения процесса; SDK его не читает, не
+  логирует и вычищает из текста ошибок. `ANTHROPIC_API_KEY` и
+  `ANTHROPIC_AUTH_TOKEN` дочернему процессу не передаются — иначе вызов ушёл бы
+  по ключу API, а не по подписке;
+- лимит окна подписки или 429 — повторяемый `llm_rate_limited` сразу (лимит
+  общий на все модели подписки); нет CLI — `llm_unavailable`, таймаут —
+  `llm_timeout`, прочий сбой CLI — `llm_failed`, все повторяемые;
+- в `cost` уходят токены; условная цена CLI под подпиской расходом не считается.
 
 ## Хостинг
 

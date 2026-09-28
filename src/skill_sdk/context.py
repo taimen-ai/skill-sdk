@@ -23,6 +23,11 @@ logger = logging.getLogger("skill_sdk")
 ENV_LLM_BASE_URL = "SKILL_LLM_BASE_URL"
 ENV_LLM_API_KEY = "SKILL_LLM_API_KEY"
 ENV_LLM_MODELS = "SKILL_LLM_MODELS"
+ENV_LLM_PROVIDER = "SKILL_LLM_PROVIDER"
+
+PROVIDER_OPENAI = "openai"
+PROVIDER_CLAUDE_CODE = "claude-code"
+PROVIDERS = (PROVIDER_OPENAI, PROVIDER_CLAUDE_CODE)
 
 LlmFactory = Callable[[], Any]
 _llm_factory: LlmFactory | None = None
@@ -31,13 +36,35 @@ _llm_factory: LlmFactory | None = None
 def configure_llm(factory: LlmFactory | None) -> None:
     """Задать, откуда хостинг берёт LLM-клиент (провайдер — настройка инсталляции).
 
-    По умолчанию — ``platform_llm.OpenAICompatibleClient`` из переменных
-    ``SKILL_LLM_BASE_URL``, ``SKILL_LLM_API_KEY``, ``SKILL_LLM_MODELS``."""
+    По умолчанию провайдер выбирает ``SKILL_LLM_PROVIDER``: ``openai`` (так и без
+    переменной) — ``platform_llm.OpenAICompatibleClient`` из ``SKILL_LLM_BASE_URL``,
+    ``SKILL_LLM_API_KEY``, ``SKILL_LLM_MODELS``; ``claude-code`` — Claude по подписке
+    через ``claude -p`` (``skill_sdk.claude_code``), модели из ``SKILL_LLM_MODELS``."""
     global _llm_factory
     _llm_factory = factory
 
 
+def _models() -> tuple[str, ...]:
+    return tuple(m.strip() for m in os.environ.get(ENV_LLM_MODELS, "").split(",") if m.strip())
+
+
 def _default_llm() -> Any:
+    provider = os.environ.get(ENV_LLM_PROVIDER, "").strip().lower() or PROVIDER_OPENAI
+    if provider not in PROVIDERS:
+        # Другой исполнитель может быть настроен верно: вызов повторяемый.
+        raise SkillError(
+            "llm_not_configured",
+            f"{ENV_LLM_PROVIDER}={provider!r}: ожидается одно из {', '.join(PROVIDERS)}",
+            retryable=True,
+        )
+    if provider == PROVIDER_CLAUDE_CODE:
+        from skill_sdk.claude_code import ClaudeCodeLlm
+
+        return ClaudeCodeLlm.from_environment(models=_models())
+    return _openai_llm()
+
+
+def _openai_llm() -> Any:
     try:
         from platform_llm import OpenAICompatibleClient
     except ImportError as error:
@@ -47,7 +74,7 @@ def _default_llm() -> Any:
             retryable=True,
         ) from error
     base_url, api_key = os.environ.get(ENV_LLM_BASE_URL), os.environ.get(ENV_LLM_API_KEY)
-    models = tuple(m.strip() for m in os.environ.get(ENV_LLM_MODELS, "").split(",") if m.strip())
+    models = _models()
     if not base_url or not api_key or not models:
         # Другой исполнитель может быть настроен: вызов повторяемый.
         raise SkillError(
