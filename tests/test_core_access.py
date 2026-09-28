@@ -135,6 +135,7 @@ class _FakeClient:
         self.calls: list[tuple[str, str, dict[str, Any], bool]] = []
         self.entered = self.exited = 0
         self.fail: _ClientError | None = None
+        self.pages: list[dict[str, Any]] = []
         _FakeClient.instances.append(self)
 
     async def __aenter__(self) -> _FakeClient:
@@ -150,6 +151,8 @@ class _FakeClient:
         self.calls.append((method, path, json_body, idempotent))
         if self.fail is not None:
             raise self.fail
+        if path == "/knowledge/entities:query":
+            return self.pages.pop(0)
         return {"stateToken": "st:1", "opened": 1}
 
     async def download_artifact_content(
@@ -229,3 +232,99 @@ async def test_adapter_without_client_package_is_retryable(monkeypatch):
     with pytest.raises(SkillError) as caught:
         await core.knowledge.preview({}, workspace_id="w1")
     assert caught.value.code == "core_unavailable" and caught.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_adapter_query_reads_every_page(client_module):
+    """K032: ``query`` проходит все страницы маршрута ядра с тем же телом и курсором."""
+    core = ControlPlaneCore("https://cp.example")
+    await core.knowledge.preview({}, workspace_id="w1")  # клиент создан
+    [client] = client_module.instances
+    client.pages = [
+        {"items": [{"kind": "credential", "key": "c:1"}], "nextCursor": "k1"},
+        {"items": [], "nextCursor": "k2"},  # страница может быть пустой до конца
+        {"items": [{"kind": "credential", "key": "c:2"}], "nextCursor": None},
+    ]
+    where = [{"attr": "validUntil", "op": "lte", "value": "2026-11-01"}]
+    items = await core.knowledge.query(
+        workspace_id="w1", kinds=["credential"], where=where, as_of="2026-10-01T00:00:00Z"
+    )
+    assert [i["key"] for i in items] == ["c:1", "c:2"]
+    bodies = [body for _, path, body, _ in client.calls if path == "/knowledge/entities:query"]
+    assert [b.get("cursor") for b in bodies] == [None, "k1", "k2"]
+    assert all(
+        b["workspaceId"] == "w1"
+        and b["kinds"] == ["credential"]
+        and b["where"] == where
+        and b["asOf"] == "2026-10-01T00:00:00Z"
+        and b["limit"] == 500
+        for b in bodies
+    )
+    client.pages = [
+        {"items": [{"kind": "credential", "key": f"c:{i}"} for i in range(3)], "nextCursor": "k"}
+    ]
+    with pytest.raises(SkillError) as caught:
+        await core.knowledge.query(workspace_id="w1", kinds=["credential"], max_items=2)
+    assert caught.value.code == "knowledge_query_too_large" and caught.value.retryable is False
+    await core.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fake_query_filters_applied_snapshots_like_memory():
+    """Подделка перечисляет применённые снимки workspace с семантикой ``where`` памяти."""
+    fake = FakeCore().knowledge
+    await fake.apply(
+        {
+            "pack": "company@1",
+            "source": "template:credential",
+            "scope": "t",
+            "entities": [
+                {
+                    "kind": "credential",
+                    "key": "lic:1",
+                    "title": "Лицензия",
+                    "attributes": {"validUntil": "2026-10-20", "okpd2": ["62.01.11"]},
+                },
+                {
+                    "kind": "credential",
+                    "key": "lic:2",
+                    "attributes": {"validUntil": "2027-05-01", "okpd2": ["62.011"]},
+                },
+                {"kind": "credential", "key": "lic:3", "attributes": {}},
+                {"kind": "offering", "key": "o:1", "attributes": {"validUntil": "2026-10-01"}},
+            ],
+        },
+        workspace_id="w1",
+    )
+    await fake.apply(
+        {"pack": "company@1", "source": "x", "entities": [{"kind": "credential", "key": "lic:9"}]},
+        workspace_id="w2",
+    )
+    soon = await fake.query(
+        workspace_id="w1",
+        kinds=["credential"],
+        where=[{"attr": "validUntil", "op": "lte", "value": "2026-11-01"}],
+    )
+    assert [(i["key"], i["title"], i["source"]) for i in soon] == [
+        ("lic:1", "Лицензия", "template:credential")
+    ]
+    by_code = await fake.query(
+        workspace_id="w1",
+        kinds=["credential"],
+        where=[{"attr": "okpd2", "op": "prefix", "value": "62.01"}],
+    )
+    assert [i["key"] for i in by_code] == ["lic:1"]  # 62.011 — не 62.01
+    missing = await fake.query(
+        workspace_id="w1",
+        kinds=["credential"],
+        where=[{"attr": "validUntil", "op": "exists", "value": False}],
+    )
+    assert [i["key"] for i in missing] == ["lic:3"]
+    assert [i["key"] for i in await fake.query(workspace_id="w1", kinds=["credential"])] == [
+        "lic:1",
+        "lic:2",
+        "lic:3",
+    ]
+    assert fake.queries[0]["where"][0]["op"] == "lte"
+    with pytest.raises(SkillError):
+        await fake.query(workspace_id="w1", kinds=["credential"], max_items=2)
