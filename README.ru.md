@@ -81,12 +81,18 @@ SDK отвергает то, что отвергло бы ядро, ещё пр�
 | `ctx.remaining()`, `ctx.check_deadline()` | сколько осталось до таймаута контракта |
 | `ctx.log` | журнал с id вызова |
 | `ctx.config(name)`, `ctx.secret(name)` | параметры и секреты хостинга; нет секрета — повторяемый `config_missing` |
-| `ctx.llm` | LLM-клиент по конфигурации инсталляции (`platform-llm` или Claude по подписке); токены учитываются сами |
+| `ctx.llm` | LLM-клиент по конфигурации инсталляции (`platform-llm` или Claude по подписке); токены учитываются сами; персональные данные физических лиц в промпте (ФИО, СНИЛС, паспорт, телефон, e-mail) заменяются маркером `[ПДн:вид]` до вызова модели, в журнал — только счёт (`skill_sdk.pii`) |
 | `ctx.add_cost(unit, amount)` | своё потребление; уходит в `cost` вызова вместе с токенами LLM |
 | `ctx.caller` | проверенный контекст вызывающего (http) |
+| `ctx.artifacts.read(id)` | содержимое артефакта через ядро учётной записью исполнителя скиллов (`ArtifactContent`: `data`, `media_type`, `text()`) |
+| `ctx.knowledge` | база знаний через ядро: `preview(snapshot, workspace_id=…)` — план без записи и `stateToken`; `apply(snapshot, workspace_id=…, expected_state=…)` — применить, только если состояние не менялось, иначе `SnapshotStale`; `document(…)` — документ с фрагментами и связями; `recall(**query)` — типизированный обход с `where` |
 
 Клиента Control Plane в контексте нет намеренно: скилл не заводит и не двигает
-задачи. Это делают исходы approval и правила ядра (TAI-ADR-0041).
+задачи. Это делают исходы approval и правила ядра (TAI-ADR-0041). `ctx.artifacts`
+и `ctx.knowledge` — узкий доступ к файлам и базе знаний (TAI-ADR-0056): адрес
+ядра — `CONTROL_PLANE_URL` или `CONTROL_PLANE_SERVER` исполнителя, credential —
+его же, через `control_plane_client` (нужен у хостинга; без него — повторяемый
+`core_unavailable`). Память — только через ядро.
 
 LLM: провайдер выбирает `SKILL_LLM_PROVIDER`. Произвольный провайдер задаётся
 кодом через `skill_sdk.configure_llm(factory)`.
@@ -155,6 +161,18 @@ def test_conflict_is_an_outcome():
         merge, {"repository": "…", "branch": "b", "commit": "abc1234", "target": "main"}
     )
     assert result.outputs["reason"] == "conflict"
+```
+
+Ядро в тестах — `FakeCore`: артефакты в памяти процесса и сверка снимка по
+ключам со `stateToken`.
+
+```python
+from skill_sdk import configure_core
+from skill_sdk.testing import FakeCore
+
+core = FakeCore()
+core.artifacts.put("a1", "key,title\nSKU-1,Разработка\n", "text/csv")
+configure_core(lambda ctx: core)
 ```
 
 ## Установка

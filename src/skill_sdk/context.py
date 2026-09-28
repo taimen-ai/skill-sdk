@@ -4,7 +4,10 @@
 времени, куда писать журнал, во что обошёлся вызов, параметры и секреты
 инсталляции, LLM-клиент по конфигурации. Клиента Control Plane в контексте нет
 намеренно: скилл не заводит и не двигает задачи — это исходы approval и правила
-(TAI-ADR-0041), а результат скилла ядро само кладёт куда надо.
+(TAI-ADR-0041), а результат скилла ядро само кладёт куда надо. Есть только узкий
+доступ к ядру (TAI-ADR-0056 Р5): ``ctx.artifacts`` — содержимое артефактов,
+``ctx.knowledge`` — предпросмотр и применение снимка, документы и обход базы
+знаний (``skill_sdk.core``).
 """
 
 from __future__ import annotations
@@ -16,7 +19,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from skill_sdk.core import Artifacts, Core, Knowledge, core_for
 from skill_sdk.errors import SkillError
+from skill_sdk.pii import redact_messages
 
 logger = logging.getLogger("skill_sdk")
 
@@ -110,11 +115,32 @@ class _LlmUsage:
 
 
 class _MeteredLlm:
-    """Тот же ``StructuredChatClient``, но каждый ответ учитывается в cost вызова."""
+    """Тот же ``StructuredChatClient``, но каждый ответ учитывается в cost вызова, а
+    промпт проходит страж персональных данных (``skill_sdk.pii``, TAI-ADR-0056 Р13)."""
 
-    def __init__(self, inner: Any, usage: _LlmUsage) -> None:
+    def __init__(self, inner: Any, usage: _LlmUsage, log: Any = None) -> None:
         self._inner = inner
         self._usage = usage
+        self._log = log or logger
+
+    def _guard(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        system_prompt = kwargs.get("system_prompt")
+        messages = kwargs.get("messages")
+        if not isinstance(system_prompt, str) and not isinstance(messages, list):
+            return kwargs
+        system, clean, found = redact_messages(
+            system_prompt if isinstance(system_prompt, str) else "",
+            messages if isinstance(messages, list) else [],
+        )
+        if found:
+            # только виды и счёт — значения в журнал не попадают
+            self._log.warning("персональные данные заменены в промпте LLM: %s", found.as_log())
+        guarded = dict(kwargs)
+        if isinstance(system_prompt, str):
+            guarded["system_prompt"] = system
+        if isinstance(messages, list):
+            guarded["messages"] = clean
+        return guarded
 
     def _record(self, result: Any) -> Any:
         usage = self._usage
@@ -134,10 +160,10 @@ class _MeteredLlm:
         return result
 
     async def chat_json(self, **kwargs: Any) -> Any:
-        return self._record(await self._inner.chat_json(**kwargs))
+        return self._record(await self._inner.chat_json(**self._guard(kwargs)))
 
     async def chat_json_object(self, **kwargs: Any) -> Any:
-        return self._record(await self._inner.chat_json_object(**kwargs))
+        return self._record(await self._inner.chat_json_object(**self._guard(kwargs)))
 
     async def aclose(self) -> None:
         await self._inner.aclose()
@@ -153,6 +179,7 @@ class SkillContext:
         self._units: dict[str, float] = {}
         self._llm_usage = _LlmUsage()
         self._llm: _MeteredLlm | None = None
+        self._core: Core | None = None
         self.log = logging.LoggerAdapter(
             logger, {"skill": invocation.skill, "invocation_id": invocation.invocation_id}
         )
@@ -210,11 +237,31 @@ class SkillContext:
 
     @property
     def llm(self) -> Any:
-        """LLM-клиент инсталляции (``platform_llm.StructuredChatClient``) с учётом токенов."""
+        """LLM-клиент инсталляции (``platform_llm.StructuredChatClient``) с учётом токенов.
+
+        Персональные данные в ``system_prompt`` и ``messages`` заменяются маркерами
+        до вызова модели (``skill_sdk.pii``)."""
         if self._llm is None:
             factory = _llm_factory or _default_llm
-            self._llm = _MeteredLlm(factory(), self._llm_usage)
+            self._llm = _MeteredLlm(factory(), self._llm_usage, self.log)
         return self._llm
+
+    # -- ядро: артефакты и база знаний --
+
+    def _core_access(self) -> Core:
+        if self._core is None:
+            self._core = core_for(self)
+        return self._core
+
+    @property
+    def artifacts(self) -> Artifacts:
+        """Содержимое артефактов через ядро учётной записью исполнителя скиллов."""
+        return self._core_access().artifacts
+
+    @property
+    def knowledge(self) -> Knowledge:
+        """База знаний через ядро: ``preview``, ``apply``, ``document``, ``recall``."""
+        return self._core_access().knowledge
 
     def cost(self) -> dict[str, Any] | None:
         """Документ ``cost`` для ``:complete`` — ``None``, если учитывать нечего."""
@@ -238,3 +285,6 @@ class SkillContext:
     async def aclose(self) -> None:
         if self._llm is not None:
             await self._llm.aclose()
+        if self._core is not None:
+            core, self._core = self._core, None
+            await core.aclose()

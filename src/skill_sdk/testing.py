@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import jsonschema
 
 from skill_sdk.context import Invocation
+from skill_sdk.core import QUERY_MAX_ITEMS, QUERY_PAGE, ArtifactContent, SnapshotStale, _too_many
+from skill_sdk.errors import SkillError
 from skill_sdk.skill import Implementation, Skill
 
 
@@ -62,3 +65,221 @@ def check_contract(skill: Skill, implementation: Implementation | None = None) -
     side_effects, _risk = skill_contract.validate_policy_columns(skill.side_effects, skill.risk)
     skill_contract.require_safe_retries(normalized, side_effects)
     return contract
+
+
+# --- подделка ядра для ctx.artifacts и ctx.knowledge (TAI-ADR-0056 Р5) ---
+
+
+def _fingerprint(state: Mapping[str, Any]) -> str:
+    import hashlib
+    import json
+
+    body = json.dumps(state, sort_keys=True, ensure_ascii=False, default=str)
+    return "st:" + hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+
+class FakeArtifacts:
+    def __init__(self) -> None:
+        self.contents: dict[str, ArtifactContent] = {}
+        self.reads: list[str] = []
+
+    def put(self, artifact_id: str, data: bytes | str, media_type: str | None = None) -> None:
+        raw = data.encode("utf-8") if isinstance(data, str) else data
+        self.contents[artifact_id] = ArtifactContent(raw, media_type)
+
+    async def read(self, artifact_id: str, *, for_task: str | None = None) -> ArtifactContent:
+        self.reads.append(artifact_id)
+        if artifact_id not in self.contents:
+            raise SkillError("artifact_not_found", f"нет артефакта {artifact_id}")
+        return self.contents[artifact_id]
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _date(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _scalar_matches(actual: Any, op: str, value: Any) -> bool:
+    if op == "eq":
+        if _number(value):
+            return _number(actual) and actual == value
+        if isinstance(value, bool):
+            return actual is value
+        return isinstance(actual, str) and actual == value
+    if op == "in":
+        return any(_scalar_matches(actual, "eq", v) for v in value)
+    if op == "prefix":
+        return isinstance(actual, str) and (actual == value or actual.startswith(value + "."))
+    if _number(value):
+        left, right = (actual if _number(actual) else None), value
+    else:
+        left, right = _date(actual), _date(value)
+    if left is None or right is None:
+        return False
+    return bool(left <= right if op == "lte" else left >= right)
+
+
+def _where_matches(attributes: Mapping[str, Any], condition: Mapping[str, Any]) -> bool:
+    """Условие ``where`` так, как его выполняет память (``context/where.py``)."""
+    op, value = condition["op"], condition.get("value")
+    actual = attributes.get(condition["attr"])
+    if op == "exists":
+        return (actual is not None and actual != []) is (True if value is None else value)
+    if actual is None:
+        return False
+    if isinstance(actual, list):
+        return any(_scalar_matches(item, op, value) for item in actual)
+    return _scalar_matches(actual, op, value)
+
+
+class FakeKnowledge:
+    """Сверка снимка источника по естественным ключам, как её видит скилл.
+
+    Состояние — открытые сущности пары ``(workspace, pack, source, scope)``;
+    ``stateToken`` — отпечаток этого состояния. ``apply`` с устаревшим
+    ``expectedState`` бросает ``SnapshotStale``. Ответ ``recall`` задаёт тест
+    (``recall_answer``), запросы копятся в ``recalls``. ``query`` перечисляет
+    сущности применённых снимков workspace с той же семантикой ``where``, что у
+    памяти (MEM-ADR-020); ``as_of`` подделка не различает — состояние одно, текущее;
+    запросы копятся в ``queries``."""
+
+    def __init__(self) -> None:
+        self.state: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        self.applied: list[dict[str, Any]] = []
+        self.documents: list[dict[str, Any]] = []
+        self.recalls: list[dict[str, Any]] = []
+        self.recall_answer: dict[str, Any] = {"sections": []}
+        self.queries: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _slot(snapshot: Mapping[str, Any], workspace_id: str) -> tuple[str, str, str, str]:
+        return (
+            workspace_id,
+            str(snapshot.get("pack", "")),
+            str(snapshot.get("source", "")),
+            str(snapshot.get("scope", "")),
+        )
+
+    @staticmethod
+    def _entities(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for entity in snapshot.get("entities") or []:
+            ident = f"{entity.get('kind')}\x1f{entity.get('key') or entity.get('naturalKey')}"
+            out[ident] = {k: v for k, v in entity.items() if k not in ("kind",)}
+        return out
+
+    def _plan(self, snapshot: Mapping[str, Any], workspace_id: str) -> dict[str, Any]:
+        """Ответ сверки в форме памяти (MEM-ADR-020): изменившийся элемент считается и
+        закрытым, и открытым (``superseded``); ``changes`` — ключи ``{kind, key}``."""
+        current = self.state.get(self._slot(snapshot, workspace_id), {})
+        wanted = self._entities(snapshot)
+        opened = [k for k in wanted if k not in current]
+        closed = [k for k in current if k not in wanted]
+        changed = [k for k in wanted if k in current and current[k] != wanted[k]]
+        unchanged = len(wanted) - len(opened) - len(changed)
+
+        def refs(idents: list[str]) -> list[dict[str, str]]:
+            return [dict(zip(("kind", "key"), i.split("\x1f", 1), strict=True)) for i in idents]
+
+        return {
+            "opened": len(opened) + len(changed),
+            "closed": len(closed) + len(changed),
+            "superseded": len(changed),
+            "unchanged": unchanged,
+            "changes": {
+                "opened": refs(opened),
+                "changed": refs(changed),
+                "closed": refs(closed),
+                "limit": 1000,
+                "truncated": False,
+            },
+            "conflicts": {"items": [], "limit": 1000, "truncated": False},
+            "stateToken": _fingerprint(current),
+        }
+
+    async def preview(self, snapshot: Mapping[str, Any], *, workspace_id: str) -> dict[str, Any]:
+        return self._plan(snapshot, workspace_id)
+
+    async def apply(
+        self,
+        snapshot: Mapping[str, Any],
+        *,
+        workspace_id: str,
+        expected_state: str | None = None,
+    ) -> dict[str, Any]:
+        plan = self._plan(snapshot, workspace_id)
+        if expected_state is not None and expected_state != plan["stateToken"]:
+            raise SnapshotStale(state_token=plan["stateToken"])
+        self.state[self._slot(snapshot, workspace_id)] = self._entities(snapshot)
+        self.applied.append(dict(snapshot))
+        return {**plan, "stateToken": _fingerprint(self.state[self._slot(snapshot, workspace_id)])}
+
+    async def document(
+        self, *, workspace_id: str, natural_key: str, **fields: Any
+    ) -> dict[str, Any]:
+        self.documents.append({"workspaceId": workspace_id, "naturalKey": natural_key, **fields})
+        return {"naturalKey": natural_key, "status": "stored"}
+
+    async def recall(self, **query: Any) -> dict[str, Any]:
+        self.recalls.append(query)
+        return self.recall_answer
+
+    async def query(
+        self,
+        *,
+        workspace_id: str,
+        kinds: list[str],
+        where: list[Mapping[str, Any]] | None = None,
+        as_of: str | None = None,
+        limit: int = QUERY_PAGE,
+        max_items: int = QUERY_MAX_ITEMS,
+    ) -> list[dict[str, Any]]:
+        self.queries.append(
+            {
+                "workspaceId": workspace_id,
+                "kinds": list(kinds),
+                "where": list(where or []),
+                "asOf": as_of,
+            }
+        )
+        found: dict[tuple[str, str], dict[str, Any]] = {}
+        for slot, entities in self.state.items():
+            if slot[0] != workspace_id:
+                continue
+            for ident, entity in entities.items():
+                kind, key = ident.split("\x1f", 1)
+                attributes = entity.get("attributes") or {}
+                if kind in kinds and all(_where_matches(attributes, c) for c in where or []):
+                    found[(kind, key)] = {
+                        "kind": kind,
+                        "key": key,
+                        "title": entity.get("title") or "",
+                        "attributes": dict(attributes),
+                        "source": slot[2],
+                        "scope": slot[3],
+                    }
+        items = [found[k] for k in sorted(found)]
+        if len(items) > max_items:
+            raise _too_many(max_items)
+        return items
+
+
+class FakeCore:
+    """``configure_core(lambda ctx: fake)`` — ядро для тестов скиллов."""
+
+    def __init__(self) -> None:
+        self.artifacts = FakeArtifacts()
+        self.knowledge = FakeKnowledge()
+        self.closed = 0
+
+    async def aclose(self) -> None:
+        self.closed += 1
