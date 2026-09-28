@@ -8,8 +8,10 @@
 - ``ctx.artifacts`` — ``read(artifact_id)``: содержимое артефакта через
   ``GET /api/v1/artifacts/{id}/content`` учётной записью исполнителя скиллов
   (право ``artifacts.read`` на workspace задачи, CP-ADR-0072 амендмент);
-- ``ctx.knowledge`` — ``preview``, ``apply``, ``document``, ``recall``: маршруты
-  ``/api/v1/knowledge/*`` и ``/api/v1/context/recall`` (CP-ADR-0060 амендмент).
+- ``ctx.knowledge`` — ``preview``, ``apply``, ``document``, ``recall``, ``query``:
+  маршруты ``/api/v1/knowledge/*`` и ``/api/v1/context/recall`` (CP-ADR-0060
+  амендмент); ``query`` — перечень сущностей видов с фильтром ``where`` через
+  ``POST /knowledge/entities:query`` по всем страницам (K032).
   Память — только через ядро.
 
 По умолчанию протоколы реализует ``ControlPlaneCore`` поверх канона клиента ядра
@@ -65,6 +67,18 @@ class SnapshotStale(SkillError):
         self.state_token = state_token
 
 
+QUERY_PAGE = 500
+QUERY_MAX_ITEMS = 10_000
+
+
+def _too_many(max_items: int) -> SkillError:
+    return SkillError(
+        "knowledge_query_too_large",
+        f"перечень больше {max_items} сущностей — сузьте виды или условия where",
+        retryable=False,
+    )
+
+
 class Artifacts(Protocol):
     async def read(self, artifact_id: str, *, for_task: str | None = None) -> ArtifactContent: ...
 
@@ -89,6 +103,17 @@ class Knowledge(Protocol):
     ) -> Json: ...
 
     async def recall(self, **query: Any) -> Json: ...
+
+    async def query(
+        self,
+        *,
+        workspace_id: str,
+        kinds: list[str],
+        where: list[Json] | None = None,
+        as_of: str | None = None,
+        limit: int = QUERY_PAGE,
+        max_items: int = QUERY_MAX_ITEMS,
+    ) -> list[Json]: ...
 
 
 class Core(Protocol):
@@ -231,6 +256,38 @@ class _ControlPlaneKnowledge:
         """Типизированный обход (CP-ADR-0064) — тело ``POST /context/recall`` в camelCase:
         ``anchor``, ``kinds``, ``relations``, ``depth``, ``where``, ``workspaceId``…"""
         return await self._post("/context/recall", dict(query))
+
+    async def query(
+        self,
+        *,
+        workspace_id: str,
+        kinds: list[str],
+        where: list[Json] | None = None,
+        as_of: str | None = None,
+        limit: int = QUERY_PAGE,
+        max_items: int = QUERY_MAX_ITEMS,
+    ) -> list[Json]:
+        """Все сущности ``kinds``, действующие на ``as_of`` (сейчас, если не задано), чьи
+        атрибуты выполняют каждое условие ``where`` (``{attr, op, value}``, литералы):
+        страницы ``POST /knowledge/entities:query`` до ``nextCursor: null``. Перечень
+        длиннее ``max_items`` — ошибка ``knowledge_query_too_large``, а не обрезка."""
+        body: Json = {"workspaceId": workspace_id, "kinds": list(kinds), "limit": limit}
+        if where:
+            body["where"] = list(where)
+        if as_of is not None:
+            body["asOf"] = as_of
+        items: list[Json] = []
+        cursor: str | None = None
+        while True:
+            page = await self._post(
+                "/knowledge/entities:query", {**body, **({"cursor": cursor} if cursor else {})}
+            )
+            items.extend(page.get("items") or [])
+            if len(items) > max_items:
+                raise _too_many(max_items)
+            cursor = page.get("nextCursor")
+            if not cursor:
+                return items
 
 
 class ControlPlaneCore:
