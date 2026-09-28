@@ -125,7 +125,7 @@ def _scalar_matches(actual: Any, op: str, value: Any) -> bool:
         left, right = _date(actual), _date(value)
     if left is None or right is None:
         return False
-    return left <= right if op == "lte" else left >= right
+    return bool(left <= right if op == "lte" else left >= right)
 
 
 def _where_matches(attributes: Mapping[str, Any], condition: Mapping[str, Any]) -> bool:
