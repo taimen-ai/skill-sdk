@@ -46,7 +46,9 @@ def merge(inputs: MergeIn, ctx: SkillContext) -> MergeOut:
     ...
     if conflict:
         return MergeOut(merged=False, reason="conflict")  # a contract outcome is an output
-    raise SkillError("git_unavailable", "remote unavailable", retryable=True)  # a failure is an error
+    raise SkillError(
+        "git_unavailable", "remote unavailable", retryable=True
+    )  # a failure is an error
 ```
 
 ## The contract comes from code
