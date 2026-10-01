@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import inspect
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -21,6 +22,10 @@ skills_module = pytest.importorskip("control_plane_agent.skills")
 from skill_sdk.http import create_app  # noqa: E402
 from skill_sdk.mcp import create_server  # noqa: E402
 from tests import sample_skills as s  # noqa: E402
+
+# Ядро с TASK-000968 передаёт ключ идемпотентности вызова в `_meta` запроса MCP
+# (`skill/idempotencyKey`); прежнее не передаёт — тест идёт против ядра рядом.
+MCP_PASSES_IDEMPOTENCY = "skill/idempotencyKey" in inspect.getsource(skills_module)
 
 
 class FakeControlPlane:
@@ -136,8 +141,8 @@ async def test_mcp() -> None:
     )
     assert ok.completed[0]["output"] == {
         "sum": 6,
-        "note": None,
-    }  # ключ идемпотентности MCP не несёт
+        "note": "idem-7" if MCP_PASSES_IDEMPOTENCY else None,
+    }
     assert ok.completed[0]["cost"] == {"units": {"ops": 1.0}}
     busy = await run(
         "mcp", handler, claimed(s.write, {**mcp, "entrypoint": "ext.write"}, {"text": "busy"})

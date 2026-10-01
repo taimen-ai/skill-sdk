@@ -6,12 +6,13 @@
 намеренно: скилл не заводит и не двигает задачи — это исходы approval и правила
 (TAI-ADR-0041), а результат скилла ядро само кладёт куда надо. Есть только узкий
 доступ к ядру (TAI-ADR-0056 Р5): ``ctx.artifacts`` — содержимое артефактов,
-``ctx.knowledge`` — предпросмотр и применение снимка, документы и обход базы
+``ctx.knowledge`` — предпросмотр и применение снимка, документы, обход и выборка базы
 знаний (``skill_sdk.core``).
 """
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import time
@@ -19,6 +20,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from skill_sdk import secrets
 from skill_sdk.core import Artifacts, Core, Knowledge, core_for
 from skill_sdk.errors import SkillError
 from skill_sdk.pii import redact_messages
@@ -30,12 +32,25 @@ ENV_LLM_API_KEY = "SKILL_LLM_API_KEY"
 ENV_LLM_MODELS = "SKILL_LLM_MODELS"
 ENV_LLM_PROVIDER = "SKILL_LLM_PROVIDER"
 
+# Секреты узла fleet (TAI-ADR-0052): канон чтения — ``skill_sdk.secrets``; имена
+# оставлены здесь ради прежних импортов.
+ENV_SECRETS_DIR = secrets.ENV_SECRETS_DIR
+DEFAULT_SECRETS_DIR = secrets.DEFAULT_SECRETS_DIR
+SECRET_FILE_NAME = secrets.SECRET_FILE_NAME
+RESERVED_SECRET_NAMES = secrets.RESERVED_SECRET_NAMES
+MAX_SECRET_FILE_BYTES = secrets.MAX_SECRET_FILE_BYTES
+
 PROVIDER_OPENAI = "openai"
 PROVIDER_CLAUDE_CODE = "claude-code"
 PROVIDERS = (PROVIDER_OPENAI, PROVIDER_CLAUDE_CODE)
 
 LlmFactory = Callable[[], Any]
 _llm_factory: LlmFactory | None = None
+# Подмена на время одного вызова (``skill_sdk.testing.invoke(llm=…)``): у каждой задачи
+# asyncio своя копия контекста, поэтому параллельные вызовы не видят чужую подделку.
+_llm_override: contextvars.ContextVar[LlmFactory | None] = contextvars.ContextVar(
+    "skill_sdk_llm_override", default=None
+)
 
 
 def configure_llm(factory: LlmFactory | None) -> None:
@@ -223,11 +238,25 @@ class SkillContext:
         return self._env.get(name, default)
 
     def secret(self, name: str) -> str:
-        """Секрет хостинга по имени; его нет — повторяемый сбой (другой хост может его иметь)."""
-        value = self._env.get(name)
-        if not value:
-            raise SkillError("config_missing", f"у хостинга не задан {name}", retryable=True)
-        return value
+        """Секрет хостинга по имени: сначала окружение, затем файл секрета узла.
+
+        1. Переменная окружения ``name`` — так секреты получает хостинг вне fleet.
+        2. Файл ``$SKILL_SDK_SECRETS_DIR/<name>`` (по умолчанию ``/run/secrets``) — так
+           узел fleet передаёт ``placement.secrets`` описания агента. Имя файла равно
+           имени секрета, перевода нет: файл ищется, только если ``name`` подходит под
+           шаблон имён секретов узла ``[a-z0-9][a-z0-9-]{0,62}``. Файл из одних
+           пробельных символов (пустой после ``strip()``) — секрета нет; у непустого
+           значения обрезаются только хвостовые ``\r`` и ``\n``, пробелы — его часть.
+
+        Нет ни там, ни там — повторяемый ``config_missing`` (другой хост может его
+        иметь), в сообщении оба места поиска, значений нет. Имя с ``/``, ``..``,
+        абсолютный путь и зарезервированное ``agent-pat`` (PAT агента, который узел
+        кладёт рядом) — ``secret_name_invalid``. Файл, который ссылкой уводит за
+        пределы каталога секретов или подменён во время чтения (на каждой из трёх
+        попыток), не обычный файл (каталог, FIFO), больше 64 КиБ или не UTF-8 —
+        ``secret_file_rejected``. Файл без прав на чтение — повторяемый
+        ``secret_unreadable``. Правило — :func:`skill_sdk.secrets.read_secret`."""
+        return secrets.read_secret(name, environ=self._env)
 
     # -- стоимость --
 
@@ -242,7 +271,7 @@ class SkillContext:
         Персональные данные в ``system_prompt`` и ``messages`` заменяются маркерами
         до вызова модели (``skill_sdk.pii``)."""
         if self._llm is None:
-            factory = _llm_factory or _default_llm
+            factory = _llm_override.get() or _llm_factory or _default_llm
             self._llm = _MeteredLlm(factory(), self._llm_usage, self.log)
         return self._llm
 
@@ -260,7 +289,7 @@ class SkillContext:
 
     @property
     def knowledge(self) -> Knowledge:
-        """База знаний через ядро: ``preview``, ``apply``, ``document``, ``recall``."""
+        """База знаний через ядро: ``preview``, ``apply``, ``document``, ``recall``, ``query``."""
         return self._core_access().knowledge
 
     def cost(self) -> dict[str, Any] | None:

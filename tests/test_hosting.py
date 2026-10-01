@@ -10,7 +10,7 @@ from platform_auth import StaticKeySet, TokenVerifier, VerifierConfig
 from platform_auth.testing import SigningKey
 
 from skill_sdk.http import create_app
-from skill_sdk.mcp import COST_META, create_server, http_app
+from skill_sdk.mcp import COST_META, IDEMPOTENCY_META, INVOCATION_META, create_server, http_app
 from tests import sample_skills as s
 
 ISSUER, AUDIENCE = "https://iam.test", "acme-skills"
@@ -121,6 +121,15 @@ async def test_mcp_tools_list_and_call():
     assert tools["math.add"].input_schema["required"] == ["a", "b"]
     assert result.structured_content == {"sum": 4, "note": None}
     assert result.meta[COST_META] == {"units": {"ops": 1.0}}
+
+
+async def test_mcp_passes_invocation_meta_to_the_context():
+    from mcp.client import Client
+
+    meta = {INVOCATION_META: "inv-7", IDEMPOTENCY_META: "idem-7"}
+    async with Client(create_server(SKILLS)) as mcp:
+        result = await mcp.call_tool("math.add", {"a": 1, "b": 1}, meta=meta)
+    assert result.structured_content == {"sum": 2, "note": "idem-7"}
 
 
 async def test_mcp_error_is_an_envelope():

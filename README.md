@@ -83,12 +83,52 @@ model, validates the output and serializes it. A contract violation is
 | `ctx.invocation_id`, `ctx.idempotency_key` | which invocation this is; a retry with the same key must not cause a second external effect |
 | `ctx.remaining()`, `ctx.check_deadline()` | time left until the contract timeout |
 | `ctx.log` | a logger carrying the invocation id |
-| `ctx.config(name)`, `ctx.secret(name)` | hosting parameters and secrets; a missing secret is a retryable `config_missing` |
+| `ctx.config(name)`, `ctx.secret(name)` | hosting parameters and secrets; a secret is looked up in the environment, then in the node secret file (see below); a missing secret is a retryable `config_missing` |
 | `ctx.llm` | an LLM client configured by the installation (`platform-llm` or Claude on a subscription); tokens are counted automatically; personal data of individuals in the prompt (full names, SNILS, passport, phone, e-mail) is replaced with a marker `[<PD>:kind]` before the model is called (the tag is the Russian abbreviation for personal data, see `skill_sdk.pii.marker`), only counts are logged (`skill_sdk.pii`) |
 | `ctx.add_cost(unit, amount)` | the skill's own consumption; goes into the invocation `cost` together with LLM tokens |
 | `ctx.caller` | the verified caller context (http) |
 | `ctx.artifacts.read(id)` | artifact content through the core, with the skills executor's credential (`ArtifactContent`: `data`, `media_type`, `text()`) |
-| `ctx.knowledge` | the knowledge base through the core: `preview(snapshot, workspace_id=…)` — a plan without writing plus `stateToken`; `apply(snapshot, workspace_id=…, expected_state=…)` — apply only if the state has not changed, otherwise `SnapshotStale`; `document(…)` — a document with chunks and links; `recall(**query)` — typed traversal with `where` |
+| `ctx.knowledge` | the knowledge base through the core: `preview(snapshot, workspace_id=…)` — a plan without writing plus `stateToken`; `apply(snapshot, workspace_id=…, expected_state=…)` — apply only if the state has not changed, otherwise `SnapshotStale`; `document(…)` — a document with chunks and links; `recall(**query)` — typed traversal with `where`; `query(workspace_id=…, kinds=[…], where=…, as_of=…)` — entities of given kinds matching conditions; walks the core's pages itself and returns them all; more than `max_items` is the error `knowledge_query_too_large`, not truncation |
+
+Secrets: `ctx.secret(name)` first reads the environment variable `name`, then the
+file `$SKILL_SDK_SECRETS_DIR/<name>` (default `/run/secrets`). A fleet node passes
+the agent's `placement.secrets` exactly this way: one file per secret, the file
+name is the secret name as is (no case or `_`/`-` translation). A file is looked
+up only for names matching the node secret name pattern `[a-z0-9][a-z0-9-]{0,62}`,
+so `ctx.secret("ext-token")` finds both an `ext-token` variable and the file,
+while `ctx.secret("EXT_TOKEN")` reads only the environment. A file of whitespace
+only (empty after `strip()`) counts as absent and `config_missing` says the file is
+empty. Otherwise only the trailing line-break characters (`\r`, `\n`) are trimmed:
+inner and leading or trailing spaces of a non-empty value are part of it.
+
+This reading rule is the canon for the platform SDKs, exposed as public functions
+of `skill_sdk.secrets`: `read_secret(name, *, environ, secrets_dir=None)` — the
+environment, then the file, exactly as `ctx.secret`; `read_secret_file(directory,
+name)` — the file only (`None` — no file, `""` — the file is empty or blank); and
+`check_secret_name(name)` — the node secret file name check. Other readers of node
+secret files call them, or repeat the rule together with shared example tests.
+
+The path is walked component by component from a descriptor of the secrets
+directory: every component is opened with `openat` and `O_NOFOLLOW`, symbolic links
+are resolved by hand and only inside the directory (the Kubernetes layout
+`token -> ..data/token` works), a link or `..` leading out of it is rejected. A
+component swapped for a link between the check and the open, or the secrets
+directory swapped while it is opened, is read again, up to three attempts, so a
+regular Kubernetes `..data` rotation passes on the second one; a swap on every attempt
+is a final `symlink_swapped` rejection.
+
+This is defense in depth, not a guarantee. The secrets directory is whatever its path
+points to at the time of reading: whoever can swap that path, or write files inside
+the directory, controls the secrets. The walk keeps a link or a swapped intermediate
+directory from leading the read out of the directory; it does not make a directory
+writable by a foreign process safe.
+
+| Outcome | Code |
+|---|---|
+| neither variable nor file; the message names both places, never values | `config_missing`, retryable |
+| name with `/`, `..` or an absolute path; the reserved `agent-pat` (the fleet node always mounts the agent's own PAT there, it is not a skill secret) | `secret_name_invalid` |
+| a symlink leading outside the secrets directory, a path swapped during reading on each of three attempts (`symlink_swapped`), not a regular file (directory, FIFO), over 64 KiB, not UTF-8 | `secret_file_rejected` (`details.reason`) |
+| the file exists but the process may not read it | `secret_unreadable`, retryable |
 
 There is deliberately no Control Plane client in the context: a skill does not
 create or move tasks. Approval outcomes and core rules do that (TAI-ADR-0041).
@@ -127,7 +167,7 @@ How `claude-code` works (`skill_sdk.claude_code.ClaudeCodeLlm`):
 |---|---|---|
 | `local` | the package is installed next to the daemon, `CONTROL_PLANE_SKILLS_LOCAL_PACKAGES=<package>` | the executor finds SDK skills itself, calls `__skill_invoke__` and gets `{outputs, cost}` |
 | `http` | `skill-sdk serve http my_skills` or `skill_sdk.http.create_app(...)` in your own ASGI app | `POST /skills/{name}@{version}`; 200 — outputs, cost in `X-Skill-Cost`; an error is `{"error": {code, retryable, …}}` |
-| `mcp` | `skill-sdk serve mcp-stdio` or `mcp-http` | a tool named after the skill; cost in `_meta["skill/cost"]`; an error is `isError` with the same `{"error": …}` |
+| `mcp` | `skill-sdk serve mcp-stdio` or `mcp-http` | a tool named after the skill; cost in `_meta["skill/cost"]`; an error is `isError` with the same `{"error": …}`; the invocation id and idempotency key come from the request `_meta["skill/invocationId"]` and `_meta["skill/idempotencyKey"]` |
 
 `http` and `mcp-http` verify an IAM token of the skill's audience through
 `platform-auth-sdk` (`SKILL_SDK_IAM_ISSUER`, `SKILL_SDK_AUDIENCE`,
@@ -161,6 +201,34 @@ def test_conflict_is_an_outcome():
         merge, {"repository": "…", "branch": "b", "commit": "abc1234", "target": "main"}
     )
     assert result.outputs["reason"] == "conflict"
+```
+
+The core in tests is `FakeCore`: artifacts in process memory and snapshot
+reconciliation by keys with a `stateToken`.
+
+```python
+from skill_sdk import configure_core
+from skill_sdk.testing import FakeCore
+
+core = FakeCore()
+core.artifacts.put("a1", "key,title\nSKU-1,Development\n", "text/csv")
+configure_core(lambda ctx: core)
+```
+
+The LLM in tests is `FakeLlm`: one answer for every call, a list in call order or a
+function of the call (`LlmCall`: prompt, schema, `temperature`, `max_tokens`) — an
+answer "by prompt pattern" is written as such a function, there is no declarative
+pattern → answer table; a `chat_json` answer is validated by `response_model`, calls
+(already past the personal-data guard) accumulate in `llm.calls` and count towards
+the cost.
+
+```python
+from skill_sdk.testing import FakeLlm, invoke
+
+llm = FakeLlm([{"summary": "short"}, {"summary": "shorter"}])
+result = invoke(summarize, {"text": "…"}, llm=llm)
+assert result.outputs == {"summary": "short"}
+assert llm.calls[0].prompt == "…"
 ```
 
 ## Installation

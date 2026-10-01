@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from dataclasses import dataclass
+import copy
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 import jsonschema
 
+from skill_sdk import context as _context
 from skill_sdk.context import Invocation
 from skill_sdk.core import QUERY_MAX_ITEMS, QUERY_PAGE, ArtifactContent, SnapshotStale, _too_many
 from skill_sdk.errors import SkillError
@@ -28,6 +30,7 @@ async def ainvoke(
     *,
     env: Mapping[str, str] | None = None,
     idempotency_key: str | None = None,
+    llm: Any = None,
 ) -> Result:
     invocation = Invocation(
         skill=skill.ref,
@@ -36,7 +39,16 @@ async def ainvoke(
         idempotency_key=idempotency_key,
         timeout_seconds=skill.timeout,
     )
-    outputs, cost = await skill.execute(inputs, invocation, env=env)
+    if llm is None:
+        outputs, cost = await skill.execute(inputs, invocation, env=env)
+        return Result(outputs, cost)
+    # Подмена — переменная контекста, а не глобальная фабрика: параллельные вызовы
+    # (asyncio.gather) видят каждый свою подделку, глобальная настройка не трогается.
+    token = _context._llm_override.set(lambda: llm)
+    try:
+        outputs, cost = await skill.execute(inputs, invocation, env=env)
+    finally:
+        _context._llm_override.reset(token)
     return Result(outputs, cost)
 
 
@@ -46,9 +58,117 @@ def invoke(
     *,
     env: Mapping[str, str] | None = None,
     idempotency_key: str | None = None,
+    llm: Any = None,
 ) -> Result:
-    """Вызвать скилл с проверкой входа и выхода по контракту; ``SkillError`` пробрасывается."""
-    return asyncio.run(ainvoke(skill, inputs, env=env, idempotency_key=idempotency_key))
+    """Вызвать скилл с проверкой входа и выхода по контракту; ``SkillError`` пробрасывается.
+
+    ``llm`` — клиент для ``ctx.llm`` на время вызова (обычно ``FakeLlm``); без него —
+    тот, что задан ``configure_llm`` или окружением. Подмена живёт в переменной
+    контекста: её видят задачи asyncio и ``asyncio.to_thread`` этого вызова, но не
+    потоки, запущенные вручную (``threading.Thread``, ``ThreadPoolExecutor.submit``) —
+    там действует настройка инсталляции."""
+    return asyncio.run(ainvoke(skill, inputs, env=env, idempotency_key=idempotency_key, llm=llm))
+
+
+# --- подделка LLM для ctx.llm ---
+
+
+@dataclass(frozen=True)
+class FakeUsage:
+    prompt_tokens: int = 10
+    completion_tokens: int = 5
+    total_tokens: int = 15
+
+
+@dataclass(frozen=True)
+class FakeResult:
+    """Та же форма, что у ``platform_llm.LlmResult`` и ``JsonResult``."""
+
+    data: Any
+    model: str
+    usage: FakeUsage
+    cost_usd: float | None
+
+
+@dataclass(frozen=True)
+class LlmCall:
+    """Один запрос скилла к модели — уже после стража персональных данных."""
+
+    mode: str  # "json" (chat_json) | "object" (chat_json_object)
+    system_prompt: str
+    messages: list[dict[str, str]]
+    schema_name: str | None = None
+    temperature: float = 0.0
+    max_tokens: int | None = None
+
+    @property
+    def prompt(self) -> str:
+        """Текст последнего сообщения — обычно то, что скилл спрашивает."""
+        return self.messages[-1]["content"] if self.messages else ""
+
+
+Answer = Mapping[str, Any] | Callable[[LlmCall], Mapping[str, Any]]
+
+
+@dataclass
+class FakeLlm:
+    """Подделка LLM-клиента инсталляции для тестов скилла.
+
+    ``answers`` — один ответ на все вызовы (словарь), ответы по порядку вызовов
+    (список) или функция от ``LlmCall``. Ответ ``chat_json`` проверяется моделью
+    ``response_model`` — несовместимый ответ падает так же, как у настоящего клиента.
+    Каждый вызов учитывается в ``calls`` и в cost вызова скилла (``usage``,
+    ``cost_usd``, ``model``). Исчерпанный список — ``AssertionError``: тест ждал
+    меньше вызовов, чем сделал скилл."""
+
+    answers: Answer | Sequence[Answer]
+    model: str = "fake-model"
+    usage: FakeUsage = field(default_factory=FakeUsage)
+    cost_usd: float | None = None
+    calls: list[LlmCall] = field(default_factory=list)
+
+    def _answer(self, call: LlmCall) -> dict[str, Any]:
+        self.calls.append(call)
+        answer: Any = self.answers
+        if isinstance(answer, Sequence) and not isinstance(answer, (str, bytes)):
+            index = len(self.calls) - 1
+            if index >= len(answer):
+                raise AssertionError(f"FakeLlm: вызов №{index + 1}, а ответов задано {len(answer)}")
+            answer = answer[index]
+        if callable(answer):
+            answer = answer(call)
+        return copy.deepcopy(dict(answer))
+
+    def _result(self, data: Any) -> FakeResult:
+        return FakeResult(data, self.model, self.usage, self.cost_usd)
+
+    async def chat_json(
+        self,
+        *,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        response_model: Any,
+        schema_name: str,
+        temperature: float = 0.0,
+    ) -> FakeResult:
+        call = LlmCall("json", system_prompt, list(messages), schema_name, temperature)
+        return self._result(response_model.model_validate(self._answer(call)))
+
+    async def chat_json_object(
+        self,
+        *,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> FakeResult:
+        call = LlmCall(
+            "object", system_prompt, list(messages), temperature=temperature, max_tokens=max_tokens
+        )
+        return self._result(self._answer(call))
+
+    async def aclose(self) -> None:
+        return None
 
 
 def check_contract(skill: Skill, implementation: Implementation | None = None) -> dict[str, Any]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -89,5 +90,32 @@ async def summarize(inputs: Doc, ctx: SkillContext) -> Summary:
         messages=[{"role": "user", "content": inputs.text}],
         response_model=Summary,
         schema_name="summary",
+    )
+    return result.data
+
+
+@skill("doc.summarize_later", version="1", side_effects="none", risk="low")
+async def summarize_later(inputs: Doc, ctx: SkillContext) -> Summary:
+    """Уступить цикл до ctx.llm: параллельные вызовы успевают переключиться."""
+    await asyncio.sleep(0)
+    result = await ctx.llm.chat_json(
+        system_prompt="Перескажи",
+        messages=[{"role": "user", "content": inputs.text}],
+        response_model=Summary,
+        schema_name="summary",
+    )
+    return result.data
+
+
+@skill("doc.summarize_sync", version="1", side_effects="none", risk="low")
+def summarize_sync(inputs: Doc, ctx: SkillContext) -> Summary:
+    """Синхронный скилл: исполняется в потоке (asyncio.to_thread), LLM — своим циклом."""
+    result = asyncio.run(
+        ctx.llm.chat_json(
+            system_prompt="Перескажи",
+            messages=[{"role": "user", "content": inputs.text}],
+            response_model=Summary,
+            schema_name="summary",
+        )
     )
     return result.data

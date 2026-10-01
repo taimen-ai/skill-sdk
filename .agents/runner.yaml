@@ -1,0 +1,10 @@
+# Машиночитаемые соглашения репозитория для исполнителя; проза — AGENTS.md.
+# Формат — runner_config.md в control-plane (src/control_plane_agent/).
+version: 1
+# path-зависимости экстр http, mcp (platform-auth-sdk) и llm (platform-llm)
+neighbours: [platform-auth-sdk, platform-llm]
+setup: make install
+checks:
+  - {name: lint, run: make lint}
+  - {name: types, run: make typecheck}
+  - {name: tests, run: make test}

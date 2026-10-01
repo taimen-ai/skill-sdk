@@ -622,14 +622,16 @@ name = "platform-auth-sdk"
 version = "0.1.0"
 source = { editable = "../platform-auth-sdk" }
 dependencies = [
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=50.0.0" },
     { name = "httpx", specifier = ">=0.28" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.14" },
 ]
 
 [package.metadata.requires-dev]
