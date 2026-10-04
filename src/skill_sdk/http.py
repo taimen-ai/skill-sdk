@@ -1,6 +1,9 @@
 """HTTP-хостинг скиллов: ASGI-приложение по протоколу ``http`` CP-ADR-0056 §5.
 
-    POST /skills/{name}@{version}   {invocationId, idempotencyKey, inputs} → outputs
+    POST /skills/{name}@{version}   {invocationId, idempotencyKey, settings, inputs} → outputs
+
+``settings`` — настройки пакета скилла (CP-ADR-0081 В3), их видит ``ctx.settings``;
+нет или ``null`` — настроек нет.
 
 - 200 — тело и есть ``outputs`` (без конверта), cost — в заголовке ``X-Skill-Cost``;
 - ``SkillError`` — ``{"error": {code, message, retryable, details}}``: 503, если
@@ -16,7 +19,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from skill_sdk.auth import Unauthorized, authenticate, require_verifier, verifier_from_env
-from skill_sdk.context import Invocation
+from skill_sdk.context import Invocation, package_settings
 from skill_sdk.errors import SkillError, from_exception
 from skill_sdk.skill import Skill
 
@@ -80,6 +83,7 @@ def create_app(
             idempotency_key=body.get("idempotencyKey"),
             timeout_seconds=target.timeout,
             caller=caller,
+            settings=package_settings(body.get("settings")),
         )
         try:
             outputs, cost = await target.execute(body["inputs"], invocation)

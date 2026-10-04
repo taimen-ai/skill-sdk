@@ -87,8 +87,10 @@ model, validates the output and serializes it. A contract violation is
 | `ctx.llm` | an LLM client configured by the installation (`platform-llm` or Claude on a subscription); tokens are counted automatically; personal data of individuals in the prompt (full names, SNILS, passport, phone, e-mail) is replaced with a marker `[<PD>:kind]` before the model is called (the tag is the Russian abbreviation for personal data, see `skill_sdk.pii.marker`), only counts are logged (`skill_sdk.pii`) |
 | `ctx.add_cost(unit, amount)` | the skill's own consumption; goes into the invocation `cost` together with LLM tokens |
 | `ctx.caller` | the verified caller context (http) |
+| `ctx.settings` | the settings of the package the skill was installed from: the effective values (saved by an administrator over the schema `default`s), a read-only mapping; a skill not from a package, or a package without settings, gets an empty mapping. The core sends the values in the invocation context (CP-ADR-0081, amendment V3); neither the environment nor a file is read |
 | `ctx.artifacts.read(id)` | artifact content through the core, with the skills executor's credential (`ArtifactContent`: `data`, `media_type`, `text()`) |
 | `ctx.knowledge` | the knowledge base through the core: `preview(snapshot, workspace_id=…)` — a plan without writing plus `stateToken`; `apply(snapshot, workspace_id=…, expected_state=…)` — apply only if the state has not changed, otherwise `SnapshotStale`; `document(…)` — a document with chunks and links; `recall(**query)` — typed traversal with `where`; `query(workspace_id=…, kinds=[…], where=…, as_of=…)` — entities of given kinds matching conditions; walks the core's pages itself and returns them all; more than `max_items` is the error `knowledge_query_too_large`, not truncation |
+| `await ctx.connection(key)` | a connection to an external system from the agent's `spec.connections`: `type`, `account`, `settings` (read-only) and `await access_token()`; see "Connections" below |
 
 Secrets: `ctx.secret(name)` first reads the environment variable `name`, then the
 file `$SKILL_SDK_SECRETS_DIR/<name>` (default `/run/secrets`). A fleet node passes
@@ -161,13 +163,67 @@ How `claude-code` works (`skill_sdk.claude_code.ClaudeCodeLlm`):
   `llm_timeout`, any other CLI failure — `llm_failed`, all retryable;
 - `cost` gets the tokens; the CLI's notional price under a subscription is not spend.
 
+## Connections
+
+A connection is an account of an external system in the organization
+(TAI-ADR-0061). Skills and connectors know it by key; the provider is only the
+`type` string.
+
+```python
+connection = await ctx.connection("crm")
+provider = PROVIDERS[connection.type]  # the integration package picks the adapter
+token = await connection.access_token()  # on every request to the provider
+```
+
+- The description (type, account, non-secret `settings`, status, material path)
+  comes from the core: `GET /api/v1/agents/me/connections/{key}`; an agent sees
+  only the keys in `spec.connections` of its current revision.
+- The material comes from the secret store, bypassing the core: the executor's
+  PAT is exchanged for an IAM token of audience `openbao` (the canonical
+  `control_plane_client.iam`), then `POST /v1/auth/jwt/login` with role
+  `agent-<principalId>` and a read of `oauth2/creds/tenants/<t>/connections/<key>`
+  or `kv/data/tenants/<t>/connections/<key>`.
+- The token is cached for at most 60 s and never past its own expiry; a token with
+  less than 5 s left is re-read, not returned; one store read per key at a time;
+  `access_token(fresh=True)` bypasses the cache (e.g. after a `401` from the provider).
+- The SDK never writes the token value to logs, errors or `repr`.
+
+| Error code | When | Retryable |
+|---|---|---|
+| `connection_revoked` | the connection was revoked | no |
+| `connection_expired` | access is lost: status `expired`, the key expired or the store cannot issue a token | no |
+| `secret_store_unavailable` | the store is not configured, unreachable, sealed, or refuses the agent's login or read because its role or policy is not synced yet (checked against the core status first) | yes |
+| `connection_not_found` | the key is not in the agent's description | no |
+| `connection_pending` | the connection exists but is not connected yet | no |
+
+Hosting settings: `SKILL_SDK_SECRET_STORE_URL` (the store address, e.g.
+`https://<host>/secrets`), `SKILL_SDK_SECRET_STORE_AUDIENCE` (`openbao`),
+`SKILL_SDK_SECRET_STORE_SCOPES` (`secrets:read`), `SKILL_SDK_SECRET_STORE_ROLE`
+(default `agent-<principalId>` from `GET /agents/me`); the identity is the same as
+the core client's (`CONTROL_PLANE_IAM_*`, `IAM_*`). Without a store address the
+description is available and `access_token()` is a retryable
+`secret_store_unavailable`.
+
+An observing connector without `ctx` keeps its own client:
+
+```python
+from skill_sdk.connections import ConnectionClient
+
+async with ConnectionClient.from_environment() as connections:
+    token = await connections.access_token("crm")
+```
+
 ## Hosting
 
 | Protocol | How | What the executor sees |
 |---|---|---|
-| `local` | the package is installed next to the daemon, `CONTROL_PLANE_SKILLS_LOCAL_PACKAGES=<package>` | the executor finds SDK skills itself, calls `__skill_invoke__` and gets `{outputs, cost}` |
-| `http` | `skill-sdk serve http my_skills` or `skill_sdk.http.create_app(...)` in your own ASGI app | `POST /skills/{name}@{version}`; 200 — outputs, cost in `X-Skill-Cost`; an error is `{"error": {code, retryable, …}}` |
-| `mcp` | `skill-sdk serve mcp-stdio` or `mcp-http` | a tool named after the skill; cost in `_meta["skill/cost"]`; an error is `isError` with the same `{"error": …}`; the invocation id and idempotency key come from the request `_meta["skill/invocationId"]` and `_meta["skill/idempotencyKey"]` |
+| `local` | the package is installed next to the daemon, `CONTROL_PLANE_SKILLS_LOCAL_PACKAGES=<package>` | the executor finds SDK skills itself, calls `__skill_invoke__(inputs, meta)` and gets `{outputs, cost}`; package settings are `meta["settings"]` |
+| `http` | `skill-sdk serve http my_skills` or `skill_sdk.http.create_app(...)` in your own ASGI app | `POST /skills/{name}@{version}`; 200 — outputs, cost in `X-Skill-Cost`; an error is `{"error": {code, retryable, …}}`; the body is `{invocationId, idempotencyKey, settings, inputs}` |
+| `mcp` | `skill-sdk serve mcp-stdio` or `mcp-http` | a tool named after the skill; cost in `_meta["skill/cost"]`; an error is `isError` with the same `{"error": …}`; the invocation id and idempotency key come from the request `_meta["skill/invocationId"]` and `_meta["skill/idempotencyKey"]`, package settings from `_meta["skill/settings"]` |
+
+`settings` is always `{package, version, schemaRevision, values}` or `null`; only
+`values` reach `ctx.settings`. No `settings`, `null` or not an object — `ctx.settings`
+is empty.
 
 `http` and `mcp-http` verify an IAM token of the skill's audience through
 `platform-auth-sdk` (`SKILL_SDK_IAM_ISSUER`, `SKILL_SDK_AUDIENCE`,
@@ -201,6 +257,25 @@ def test_conflict_is_an_outcome():
         merge, {"repository": "…", "branch": "b", "commit": "abc1234", "target": "main"}
     )
     assert result.outputs["reason"] == "conflict"
+```
+
+Package settings in tests: `invoke(skill, inputs, settings={...})` — these are the
+`values` `ctx.settings` will see; without `settings` the skill behaves as one not from a
+package.
+
+Connections in tests are `FakeConnections`: the core's description, the store and
+the clock live in memory, and the client is the real `ConnectionClient` (same
+cache, same errors).
+
+```python
+from skill_sdk import configure_connections
+from skill_sdk.testing import FakeConnections
+
+connections = FakeConnections()
+connections.add("crm", type="crm-x", account="example.test", token="t-1")
+configure_connections(lambda ctx: connections.client())
+connections.revoke("crm")  # the next access_token() is connection_revoked
+connections.seal()  # secret_store_unavailable, retryable
 ```
 
 The core in tests is `FakeCore`: artifacts in process memory and snapshot
@@ -238,6 +313,7 @@ uv add skill-sdk                    # contract, local, testing, export
 uv add "skill-sdk[http]"            # + ASGI hosting and token verification
 uv add "skill-sdk[mcp]"             # + MCP server
 uv add "skill-sdk[llm]"             # + ctx.llm
+uv add "skill-sdk[connections]"     # + ctx.connection (secret store HTTP API)
 ```
 
 `platform-auth-sdk` and `platform-llm` are sibling folders (the flat layout of the

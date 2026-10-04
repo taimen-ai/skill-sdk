@@ -1,10 +1,10 @@
 # Цели, которые зовут CI (.github/workflows/ci.yml) и проверки исполнителя
-# (.agents/runner.yaml). Соседи по плоской раскладке: ../platform-auth-sdk и
-# ../platform-llm — path-зависимости экстр http, mcp и llm.
+# (.agents/runner.yaml). Соседи в sdk/ суперпроекта (TAI-ADR-0064): ../platform-auth-sdk
+# и ../platform-llm — path-зависимости экстр http, mcp и llm.
 .PHONY: install lint fmt typecheck test test-e2e check
 
-# Ядро рядом — только для сквозного теста исполнителя (test-e2e).
-CONTROL_PLANE_DIR ?= ../control-plane
+# Ядро в раскладке суперпроекта — только для сквозного теста исполнителя (test-e2e).
+CONTROL_PLANE_DIR ?= ../../services/control-plane
 
 install:
 	uv sync --frozen --all-extras

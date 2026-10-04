@@ -37,7 +37,7 @@ the umbrella checkout, where the siblings are submodules:
 
 ```bash
 git clone --recurse-submodules https://github.com/taimen-ai/taimen.git
-cd taimen/skill-sdk
+cd taimen/sdk/skill-sdk
 uv sync                       # runtime dependencies plus the `dev` group
 uv run pytest                 # tests
 uv run ruff check .           # lint

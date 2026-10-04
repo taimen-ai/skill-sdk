@@ -21,7 +21,7 @@ from typing import Any
 import jsonschema
 from pydantic import BaseModel, ValidationError
 
-from skill_sdk.context import Invocation, SkillContext
+from skill_sdk.context import Invocation, SkillContext, package_settings
 from skill_sdk.errors import input_violation, output_violation
 
 JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
@@ -316,6 +316,7 @@ class Skill:
             invocation_id=meta.get("invocationId"),
             idempotency_key=meta.get("idempotencyKey"),
             timeout_seconds=meta.get("timeoutSeconds") or self.timeout,
+            settings=package_settings(meta.get("settings")),
         )
         outputs, cost = asyncio.run(self.execute(inputs, invocation))
         return {"outputs": outputs, "cost": cost}

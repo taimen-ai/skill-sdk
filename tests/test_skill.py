@@ -16,7 +16,8 @@ from skill_sdk.package import drift, export
 from skill_sdk.testing import check_contract, invoke
 from tests import sample_skills as s
 
-CONTROL_PLANE = Path(__file__).resolve().parents[2] / "control-plane" / "src"
+# Ядро в раскладке суперпроекта (TAI-ADR-0064): ../../services/control-plane от skill-sdk.
+CONTROL_PLANE = Path(__file__).resolve().parents[3] / "services" / "control-plane" / "src"
 
 
 # --- контракт -----------------------------------------------------------------
@@ -54,7 +55,7 @@ def test_implementation_is_chosen_at_export():
     }
 
 
-@pytest.mark.skipif(not CONTROL_PLANE.exists(), reason="control-plane не лежит рядом")
+@pytest.mark.skipif(not CONTROL_PLANE.exists(), reason="control-plane не лежит в ../../services/control-plane")
 @pytest.mark.parametrize("target", [s.add, s.classify, s.echo, s.write, s.summarize])
 def test_contracts_pass_core_validators(target):
     sys.path.insert(0, str(CONTROL_PLANE))

@@ -2,9 +2,10 @@ name: CI
 
 # The same make targets as the executor's checks (.agents/runner.yaml).
 # platform-auth-sdk and platform-llm are path dependencies of the extras
-# (../platform-auth-sdk, ../platform-llm; flat layout, ADR-0029), so they are
-# checked out next to this repository. The end-to-end test through the core's
-# executor (make test-e2e) runs in the umbrella's CI, where the core is at hand.
+# (../platform-auth-sdk, ../platform-llm), so they are checked out next to this
+# repository, in sdk/ as in the umbrella layout (TAI-ADR-0064). The end-to-end
+# test through the core's executor (make test-e2e) runs in the umbrella's CI,
+# where the core is at hand.
 on:
   push:
     branches: [main]
@@ -21,25 +22,25 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: skill-sdk
+        working-directory: sdk/skill-sdk
     steps:
       - uses: actions/checkout@v4
         with:
-          path: skill-sdk
+          path: sdk/skill-sdk
       - uses: actions/checkout@v4
         with:
           repository: ${{ vars.PLATFORM_AUTH_SDK_REPO || format('{0}/platform-auth-sdk', github.repository_owner) }}
           ssh-key: ${{ secrets.PLATFORM_AUTH_SDK_DEPLOY_KEY }}
-          path: platform-auth-sdk
+          path: sdk/platform-auth-sdk
       - uses: actions/checkout@v4
         with:
           repository: ${{ vars.PLATFORM_LLM_REPO || format('{0}/platform-llm', github.repository_owner) }}
           ssh-key: ${{ secrets.PLATFORM_LLM_DEPLOY_KEY }}
-          path: platform-llm
+          path: sdk/platform-llm
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
-          cache-dependency-glob: skill-sdk/uv.lock
+          cache-dependency-glob: sdk/skill-sdk/uv.lock
       - run: make install
       - run: make lint
       - run: make typecheck

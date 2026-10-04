@@ -1046,11 +1046,15 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
+    { name = "httpx" },
     { name = "mcp" },
     { name = "platform-auth-sdk" },
     { name = "platform-llm" },
     { name = "starlette" },
     { name = "uvicorn" },
+]
+connections = [
+    { name = "httpx" },
 ]
 http = [
     { name = "platform-auth-sdk" },
@@ -1077,6 +1081,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", marker = "extra == 'connections'", specifier = ">=0.27" },
     { name = "jsonschema", specifier = ">=4.23" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2.0.0" },
     { name = "platform-auth-sdk", marker = "extra == 'http'", editable = "../platform-auth-sdk" },
@@ -1084,12 +1089,12 @@ requires-dist = [
     { name = "platform-llm", marker = "extra == 'llm'", editable = "../platform-llm" },
     { name = "pydantic", specifier = ">=2.8" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "skill-sdk", extras = ["http", "mcp", "llm"], marker = "extra == 'all'" },
+    { name = "skill-sdk", extras = ["http", "mcp", "llm", "connections"], marker = "extra == 'all'" },
     { name = "starlette", marker = "extra == 'http'", specifier = ">=0.37" },
     { name = "uvicorn", marker = "extra == 'http'", specifier = ">=0.30" },
     { name = "uvicorn", marker = "extra == 'mcp'", specifier = ">=0.30" },
 ]
-provides-extras = ["http", "mcp", "llm", "all"]
+provides-extras = ["http", "mcp", "llm", "connections", "all"]
 
 [package.metadata.requires-dev]
 dev = [

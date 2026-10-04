@@ -5,6 +5,8 @@
 structured content; cost — в ``_meta["skill/cost"]``. Id вызова и ключ идемпотентности
 хостинг берёт из ``_meta`` запроса (``skill/invocationId``, ``skill/idempotencyKey``) —
 как ``invocationId`` и ``idempotencyKey`` тела у ``http``; без них ``ctx`` их не знает.
+Настройки пакета скилла — ``_meta["skill/settings"]`` (CP-ADR-0081 В3, ``ctx.settings``);
+нет ключа — настроек нет.
 ``SkillError`` — ``isError`` с единственным текстовым блоком ``{"error": {code, message, retryable,
 details}}``: по нему исполнитель узнаёт код и повторяемость.
 
@@ -20,7 +22,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from skill_sdk.auth import Unauthorized, authenticate, require_verifier, verifier_from_env
-from skill_sdk.context import Invocation
+from skill_sdk.context import Invocation, package_settings
 from skill_sdk.errors import SkillError, from_exception
 from skill_sdk.skill import Skill
 
@@ -28,13 +30,16 @@ logger = logging.getLogger("skill_sdk.mcp")
 COST_META = "skill/cost"
 INVOCATION_META = "skill/invocationId"
 IDEMPOTENCY_META = "skill/idempotencyKey"
+SETTINGS_META = "skill/settings"
 
 
-def _request_meta(params: Any) -> tuple[str | None, str | None]:
-    """Id вызова и ключ идемпотентности из ``_meta`` запроса ``tools/call``."""
+def _request_meta(params: Any) -> Mapping[str, Any]:
     meta = getattr(params, "meta", None)
-    if not isinstance(meta, Mapping):
-        return None, None
+    return meta if isinstance(meta, Mapping) else {}
+
+
+def _invocation_meta(meta: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Id вызова и ключ идемпотентности из ``_meta`` запроса ``tools/call``."""
 
     def text(key: str) -> str | None:
         value = meta.get(key)
@@ -88,13 +93,15 @@ def create_server(skills: Iterable[Skill], *, name: str = "skills") -> Any:
             return failure_result(
                 SkillError("skill_not_hosted", f"{params.name} здесь не хостится")
             )
-        invocation_id, idempotency_key = _request_meta(params)
+        meta = _request_meta(params)
+        invocation_id, idempotency_key = _invocation_meta(meta)
         invocation = Invocation(
             skill=target.ref,
             protocol="mcp",
             invocation_id=invocation_id,
             idempotency_key=idempotency_key,
             timeout_seconds=target.timeout,
+            settings=package_settings(meta.get(SETTINGS_META)),
         )
         try:
             outputs, cost = await target.execute(params.arguments or {}, invocation)

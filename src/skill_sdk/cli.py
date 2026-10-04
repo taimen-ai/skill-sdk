@@ -1,10 +1,10 @@
 """``skill-sdk`` — контракт, экспорт в пакет, вызов и хостинг скиллов из командной строки.
 
-    skill-sdk list     taimen_selfdev
-    skill-sdk contract taimen_selfdev.git_merge:run
-    skill-sdk export   --package packages/selfdev taimen_selfdev            # записать YAML
-    skill-sdk export   --package packages/selfdev --check taimen_selfdev    # CI: код == YAML
-    skill-sdk invoke   taimen_selfdev.adr_conformance:invoke --input '{"repository": "."}'
+    skill-sdk list     acme_skills
+    skill-sdk contract acme_skills.reports:build
+    skill-sdk export   --package packages/acme acme_skills            # записать YAML
+    skill-sdk export   --package packages/acme --check acme_skills    # CI: код == YAML
+    skill-sdk invoke   acme_skills.reports:build --input '{"period": "2026-09"}'
     skill-sdk serve http      --port 8080 my_skills
     skill-sdk serve mcp-http  --port 8081 my_skills
     skill-sdk serve mcp-stdio my_skills

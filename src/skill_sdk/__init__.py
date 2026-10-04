@@ -17,6 +17,7 @@ async def summarize(inputs: Query, ctx: SkillContext) -> Answer:
     return result.data
 """
 
+from skill_sdk.connections import Connection, ConnectionClient, configure_connections
 from skill_sdk.context import Invocation, SkillContext, configure_llm
 from skill_sdk.core import ArtifactContent, SnapshotStale, configure_core
 from skill_sdk.errors import SkillError
@@ -24,6 +25,8 @@ from skill_sdk.skill import Http, Local, Mcp, Skill, discover, skill
 
 __all__ = [
     "ArtifactContent",
+    "Connection",
+    "ConnectionClient",
     "Http",
     "Invocation",
     "Local",
@@ -32,6 +35,7 @@ __all__ = [
     "SkillContext",
     "SkillError",
     "SnapshotStale",
+    "configure_connections",
     "configure_core",
     "configure_llm",
     "discover",

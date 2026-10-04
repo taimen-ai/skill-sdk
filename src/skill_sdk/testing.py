@@ -6,12 +6,20 @@ import asyncio
 import copy
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import jsonschema
 
 from skill_sdk import context as _context
+from skill_sdk.connections import (
+    ConnectionClient,
+    ConnectionInfo,
+    ConnectionNotFound,
+    Material,
+    MaterialRefused,
+    SecretStoreUnavailable,
+)
 from skill_sdk.context import Invocation
 from skill_sdk.core import QUERY_MAX_ITEMS, QUERY_PAGE, ArtifactContent, SnapshotStale, _too_many
 from skill_sdk.errors import SkillError
@@ -31,6 +39,7 @@ async def ainvoke(
     env: Mapping[str, str] | None = None,
     idempotency_key: str | None = None,
     llm: Any = None,
+    settings: Mapping[str, Any] | None = None,
 ) -> Result:
     invocation = Invocation(
         skill=skill.ref,
@@ -38,6 +47,7 @@ async def ainvoke(
         invocation_id="test",
         idempotency_key=idempotency_key,
         timeout_seconds=skill.timeout,
+        settings=_context.package_settings({"values": settings}),
     )
     if llm is None:
         outputs, cost = await skill.execute(inputs, invocation, env=env)
@@ -59,6 +69,7 @@ def invoke(
     env: Mapping[str, str] | None = None,
     idempotency_key: str | None = None,
     llm: Any = None,
+    settings: Mapping[str, Any] | None = None,
 ) -> Result:
     """Вызвать скилл с проверкой входа и выхода по контракту; ``SkillError`` пробрасывается.
 
@@ -66,8 +77,13 @@ def invoke(
     тот, что задан ``configure_llm`` или окружением. Подмена живёт в переменной
     контекста: её видят задачи asyncio и ``asyncio.to_thread`` этого вызова, но не
     потоки, запущенные вручную (``threading.Thread``, ``ThreadPoolExecutor.submit``) —
-    там действует настройка инсталляции."""
-    return asyncio.run(ainvoke(skill, inputs, env=env, idempotency_key=idempotency_key, llm=llm))
+    там действует настройка инсталляции.
+
+    ``settings`` — значения настроек пакета для ``ctx.settings`` (``values`` контекста
+    вызова); без них — скилл не из пакета, ``ctx.settings`` пуст."""
+    return asyncio.run(
+        ainvoke(skill, inputs, env=env, idempotency_key=idempotency_key, llm=llm, settings=settings)
+    )
 
 
 # --- подделка LLM для ctx.llm ---
@@ -403,3 +419,168 @@ class FakeCore:
 
     async def aclose(self) -> None:
         self.closed += 1
+
+
+# --- подделка подключений для ctx.connection и ConnectionClient (TAI-ADR-0061) ---
+
+
+class FakeConnectionDirectory:
+    """Сведения ядра о подключениях агента (``GET /agents/me/connections/{key}``)."""
+
+    def __init__(self) -> None:
+        self.infos: dict[str, ConnectionInfo] = {}
+        self.lookups: list[str] = []
+        self.unavailable = False
+        self.closed = 0
+
+    async def connection(self, key: str) -> ConnectionInfo:
+        self.lookups.append(key)
+        if self.unavailable:
+            raise SkillError("core_unavailable", "ядро недоступно", retryable=True)
+        if key not in self.infos:
+            raise ConnectionNotFound(key)
+        return self.infos[key]
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+class FakeSecretStore:
+    """Хранилище в памяти, которое ведёт себя как настоящее: материал выдаётся только
+    по пути из политики агента (``granted``), нет политики — отказ ``403``, нет
+    материала — ``404``, запечатанное — повторяемый ``secret_store_unavailable``."""
+
+    def __init__(self) -> None:
+        self.materials: dict[str, Material] = {}
+        self.granted: set[str] = set()
+        self.refusals: dict[str, int] = {}
+        self.reads: list[str] = []
+        self.sealed = False
+        self.closed = 0
+
+    async def read(self, secret_ref: str) -> Material:
+        self.reads.append(secret_ref)
+        if self.sealed:
+            raise SecretStoreUnavailable(
+                "хранилище секретов запечатано или не готово", reason="sealed_or_standby"
+            )
+        if secret_ref in self.refusals:
+            raise MaterialRefused(self.refusals[secret_ref])
+        if secret_ref not in self.granted:
+            raise MaterialRefused(403)
+        if secret_ref not in self.materials:
+            raise MaterialRefused(404)
+        return self.materials[secret_ref]
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+class FakeConnections:
+    """Подключения агента для тестов: сведения ядра, хранилище и часы в одном месте.
+
+    ``add`` заводит активное подключение с материалом, ``rotate`` меняет токен (как
+    обновление плагином), ``revoke``/``expire`` — как отзыв и потеря доступа в ядре
+    (материал и политика уходят из хранилища), ``seal``/``unseal`` — запечатанное
+    хранилище, ``advance`` двигает часы клиента. Клиент — настоящий
+    ``ConnectionClient``, поэтому кэш и ошибки те же, что у хостинга::
+
+        fake = FakeConnections()
+        fake.add("crm", type="crm-x", account="example.test", token="t-1")
+        configure_connections(lambda ctx: fake.client())
+    """
+
+    def __init__(self, *, tenant: str = "tenant-1") -> None:
+        self.tenant = tenant
+        self.directory = FakeConnectionDirectory()
+        self.store = FakeSecretStore()
+        self.monotonic = 0.0
+        self.now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def advance(self, seconds: float) -> None:
+        self.monotonic += seconds
+        self.now += timedelta(seconds=seconds)
+
+    def _ref(self, key: str, auth: str) -> str:
+        root = "oauth2/creds" if auth == "oauth2" else "kv/data"
+        return f"{root}/tenants/{self.tenant}/connections/{key}"
+
+    def add(
+        self,
+        key: str,
+        *,
+        type: str,
+        account: str | None = None,
+        settings: Mapping[str, Any] | None = None,
+        token: str = "fake-access-token",
+        auth: str = "token",
+        expires_at: datetime | None = None,
+        type_version: int = 1,
+    ) -> ConnectionInfo:
+        ref = self._ref(key, auth)
+        info = ConnectionInfo(
+            key=key,
+            type=type,
+            status="active",
+            type_version=type_version,
+            account=account,
+            auth=auth,
+            settings=dict(settings or {}),
+            secret_ref=ref,
+            expires_at=expires_at if auth == "token" else None,
+        )
+        self.directory.infos[key] = info
+        self.store.materials[ref] = Material(access_token=token, expires_at=expires_at)
+        self.store.granted.add(ref)
+        return info
+
+    def pending(self, key: str, *, type: str) -> ConnectionInfo:
+        info = ConnectionInfo(key=key, type=type, status="pending")
+        self.directory.infos[key] = info
+        return info
+
+    def rotate(self, key: str, token: str, *, expires_at: datetime | None = None) -> None:
+        ref = self.directory.infos[key].secret_ref
+        assert ref is not None
+        self.store.materials[ref] = Material(access_token=token, expires_at=expires_at)
+
+    def _withdraw(self, key: str, status: str, *, keep_ref: bool) -> None:
+        info = self.directory.infos[key]
+        if info.secret_ref is not None:
+            self.store.granted.discard(info.secret_ref)
+            if not keep_ref:
+                self.store.materials.pop(info.secret_ref, None)
+        self.directory.infos[key] = ConnectionInfo(
+            key=info.key,
+            type=info.type,
+            status=status,
+            type_version=info.type_version,
+            account=info.account,
+            auth=info.auth if keep_ref else None,
+            settings=info.settings,
+            secret_ref=info.secret_ref if keep_ref else None,
+            expires_at=info.expires_at,
+        )
+
+    def revoke(self, key: str) -> None:
+        """Отзыв (CP-ADR-0079 п.10): материал удалён, политика снята, учёт — ``revoked``."""
+        self._withdraw(key, "revoked", keep_ref=False)
+
+    def expire(self, key: str) -> None:
+        """Потеря доступа: учёт — ``expired``, в политику агента подключение не входит."""
+        self._withdraw(key, "expired", keep_ref=True)
+
+    def seal(self) -> None:
+        self.store.sealed = True
+
+    def unseal(self) -> None:
+        self.store.sealed = False
+
+    def client(self, *, cache_seconds: float = 60.0) -> ConnectionClient:
+        return ConnectionClient(
+            self.directory,
+            self.store,
+            cache_seconds=cache_seconds,
+            clock=lambda: self.monotonic,
+            now=lambda: self.now,
+        )

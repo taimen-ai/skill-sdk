@@ -84,8 +84,10 @@ SDK отвергает то, что отвергло бы ядро, ещё пр�
 | `ctx.llm` | LLM-клиент по конфигурации инсталляции (`platform-llm` или Claude по подписке); токены учитываются сами; персональные данные физических лиц в промпте (ФИО, СНИЛС, паспорт, телефон, e-mail) заменяются маркером `[ПДн:вид]` до вызова модели, в журнал — только счёт (`skill_sdk.pii`) |
 | `ctx.add_cost(unit, amount)` | своё потребление; уходит в `cost` вызова вместе с токенами LLM |
 | `ctx.caller` | проверенный контекст вызывающего (http) |
+| `ctx.settings` | настройки пакета, из которого скилл установлен: действующие значения (сохранённые администратором поверх `default` схемы), отображение только для чтения; скилл не из пакета или пакет без настроек — пустое отображение. Значения приходят от ядра в контексте вызова (CP-ADR-0081, амендмент В3), ни окружения, ни файла не читают |
 | `ctx.artifacts.read(id)` | содержимое артефакта через ядро учётной записью исполнителя скиллов (`ArtifactContent`: `data`, `media_type`, `text()`) |
 | `ctx.knowledge` | база знаний через ядро: `preview(snapshot, workspace_id=…)` — план без записи и `stateToken`; `apply(snapshot, workspace_id=…, expected_state=…)` — применить, только если состояние не менялось, иначе `SnapshotStale`; `document(…)` — документ с фрагментами и связями; `recall(**query)` — типизированный обход с `where`; `query(workspace_id=…, kinds=[…], where=…, as_of=…)` — сущности заданных видов по условиям: страницы ядра обходит сам и возвращает все; длиннее `max_items` — ошибка `knowledge_query_too_large`, а не обрезка |
+| `await ctx.connection(key)` | подключение к внешней системе из `spec.connections` агента: `type`, `account`, `settings` (только чтение) и `await access_token()`; ниже «Подключения» |
 
 Секреты: `ctx.secret(name)` сначала читает переменную окружения `name`, затем
 файл `$SKILL_SDK_SECRETS_DIR/<name>` (по умолчанию `/run/secrets`). Ровно так узел
@@ -161,13 +163,66 @@ LLM: провайдер выбирает `SKILL_LLM_PROVIDER`. Произвол�
   `llm_timeout`, прочий сбой CLI — `llm_failed`, все повторяемые;
 - в `cost` уходят токены; условная цена CLI под подпиской расходом не считается.
 
+## Подключения
+
+Подключение — учётка внешней системы в организации (TAI-ADR-0061). Скилл и
+коннектор знают его по ключу, провайдер — только строка `type`.
+
+```python
+connection = await ctx.connection("crm")
+provider = PROVIDERS[connection.type]  # адаптер выбирает пакет интеграции
+token = await connection.access_token()  # на каждый запрос к провайдеру
+```
+
+- Сведения (тип, учётка, несекретные `settings`, статус, путь материала) — из
+  ядра: `GET /api/v1/agents/me/connections/{key}`; агент видит только ключи из
+  `spec.connections` своей текущей ревизии.
+- Материал — из хранилища секретов, мимо ядра: PAT исполнителя обменивается на
+  токен IAM audience `openbao` (канон `control_plane_client.iam`), вход
+  `POST /v1/auth/jwt/login` ролью `agent-<principalId>`, чтение
+  `oauth2/creds/tenants/<t>/connections/<key>` или
+  `kv/data/tenants/<t>/connections/<key>`.
+- Кэш токена — не дольше 60 с и не дольше срока самого токена; токен, которому
+  осталось меньше 5 с, перечитывается, а не отдаётся; один ключ — один поход в
+  хранилище за раз;
+  `access_token(fresh=True)` — мимо кэша (например, после `401` провайдера).
+- Значение токена SDK не пишет ни в журнал, ни в ошибки, ни в `repr`.
+
+| Код ошибки | Когда | Повторяемо |
+|---|---|---|
+| `connection_revoked` | подключение отозвано | нет |
+| `connection_expired` | доступ потерян: статус `expired`, срок ключа вышел или хранилище не может выдать токен | нет |
+| `secret_store_unavailable` | хранилище не настроено, недоступно, запечатано или не пускает агента: роль или политика ещё не сведены (сначала сверяется статус в ядре) | да |
+| `connection_not_found` | ключа нет в описании агента | нет |
+| `connection_pending` | подключение заведено, но ещё не подключено | нет |
+
+Настройка хостинга: `SKILL_SDK_SECRET_STORE_URL` (адрес хранилища, например
+`https://<стенд>/secrets`), `SKILL_SDK_SECRET_STORE_AUDIENCE` (`openbao`),
+`SKILL_SDK_SECRET_STORE_SCOPES` (`secrets:read`), `SKILL_SDK_SECRET_STORE_ROLE`
+(по умолчанию `agent-<principalId>` из `GET /agents/me`); identity — та же, что у
+клиента ядра (`CONTROL_PLANE_IAM_*`, `IAM_*`). Без адреса хранилища сведения
+доступны, а `access_token()` — повторяемый `secret_store_unavailable`.
+
+Коннектор-наблюдатель без `ctx` держит свой клиент:
+
+```python
+from skill_sdk.connections import ConnectionClient
+
+async with ConnectionClient.from_environment() as connections:
+    token = await connections.access_token("crm")
+```
+
 ## Хостинг
 
 | Протокол | Как | Что видит исполнитель |
 |---|---|---|
-| `local` | пакет установлен рядом с демоном, `CONTROL_PLANE_SKILLS_LOCAL_PACKAGES=<пакет>` | исполнитель находит скиллы SDK сам, вызывает `__skill_invoke__` и получает `{outputs, cost}` |
-| `http` | `skill-sdk serve http my_skills` или `skill_sdk.http.create_app(...)` в своём ASGI | `POST /skills/{name}@{version}`; 200 — outputs, cost — в `X-Skill-Cost`; ошибка — `{"error": {code, retryable, …}}` |
-| `mcp` | `skill-sdk serve mcp-stdio` или `mcp-http` | инструмент с именем скилла; cost — в `_meta["skill/cost"]`; ошибка — `isError` с тем же `{"error": …}`; id вызова и ключ идемпотентности — `_meta["skill/invocationId"]` и `_meta["skill/idempotencyKey"]` запроса |
+| `local` | пакет установлен рядом с демоном, `CONTROL_PLANE_SKILLS_LOCAL_PACKAGES=<пакет>` | исполнитель находит скиллы SDK сам, вызывает `__skill_invoke__(inputs, meta)` и получает `{outputs, cost}`; настройки пакета — `meta["settings"]` |
+| `http` | `skill-sdk serve http my_skills` или `skill_sdk.http.create_app(...)` в своём ASGI | `POST /skills/{name}@{version}`; 200 — outputs, cost — в `X-Skill-Cost`; ошибка — `{"error": {code, retryable, …}}`; тело — `{invocationId, idempotencyKey, settings, inputs}` |
+| `mcp` | `skill-sdk serve mcp-stdio` или `mcp-http` | инструмент с именем скилла; cost — в `_meta["skill/cost"]`; ошибка — `isError` с тем же `{"error": …}`; id вызова и ключ идемпотентности — `_meta["skill/invocationId"]` и `_meta["skill/idempotencyKey"]` запроса, настройки пакета — `_meta["skill/settings"]` |
+
+`settings` везде — `{package, version, schemaRevision, values}` или `null`; в
+`ctx.settings` попадают только `values`. Нет `settings`, `null` или не объект —
+`ctx.settings` пуст.
 
 `http` и `mcp-http` проверяют IAM-токен audience скилла через `platform-auth-sdk`
 (`SKILL_SDK_IAM_ISSUER`, `SKILL_SDK_AUDIENCE`, `SKILL_SDK_JWKS_URL`). Без проверки
@@ -202,6 +257,9 @@ def test_conflict_is_an_outcome():
     assert result.outputs["reason"] == "conflict"
 ```
 
+Настройки пакета в тестах — `invoke(skill, inputs, settings={...})`: это `values`,
+их и увидит `ctx.settings`; без `settings` скилл ведёт себя как скилл не из пакета.
+
 Ядро в тестах — `FakeCore`: артефакты в памяти процесса и сверка снимка по
 ключам со `stateToken`.
 
@@ -212,6 +270,20 @@ from skill_sdk.testing import FakeCore
 core = FakeCore()
 core.artifacts.put("a1", "key,title\nSKU-1,Разработка\n", "text/csv")
 configure_core(lambda ctx: core)
+```
+
+Подключения в тестах — `FakeConnections`: сведения ядра, хранилище и часы в
+памяти, клиент — настоящий `ConnectionClient` (тот же кэш и те же ошибки).
+
+```python
+from skill_sdk import configure_connections
+from skill_sdk.testing import FakeConnections
+
+connections = FakeConnections()
+connections.add("crm", type="crm-x", account="example.test", token="t-1")
+configure_connections(lambda ctx: connections.client())
+connections.revoke("crm")  # следующий access_token() — connection_revoked
+connections.seal()  # secret_store_unavailable, повторяемо
 ```
 
 LLM в тестах — `FakeLlm`: ответ один на все вызовы, список по порядку или функция
@@ -236,6 +308,7 @@ uv add skill-sdk                    # контракт, local, тесты, эк�
 uv add "skill-sdk[http]"            # + ASGI-хостинг и проверка токена
 uv add "skill-sdk[mcp]"             # + MCP-сервер
 uv add "skill-sdk[llm]"             # + ctx.llm
+uv add "skill-sdk[connections]"     # + ctx.connection (HTTP API хранилища секретов)
 ```
 
 `platform-auth-sdk` и `platform-llm` подключаются соседними папками (плоская

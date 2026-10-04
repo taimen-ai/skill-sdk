@@ -2,25 +2,30 @@
 
 Что скилл вправе знать и делать внутри вызова: кто и какой вызов, сколько осталось
 времени, куда писать журнал, во что обошёлся вызов, параметры и секреты
-инсталляции, LLM-клиент по конфигурации. Клиента Control Plane в контексте нет
-намеренно: скилл не заводит и не двигает задачи — это исходы approval и правила
-(TAI-ADR-0041), а результат скилла ядро само кладёт куда надо. Есть только узкий
+инсталляции, настройки пакета скилла (CP-ADR-0081), LLM-клиент по конфигурации.
+Клиента Control Plane в контексте нет намеренно: скилл не заводит и не двигает
+задачи — это исходы approval и правила (TAI-ADR-0041), а результат скилла ядро
+само кладёт куда надо. Есть только узкий
 доступ к ядру (TAI-ADR-0056 Р5): ``ctx.artifacts`` — содержимое артефактов,
 ``ctx.knowledge`` — предпросмотр и применение снимка, документы, обход и выборка базы
-знаний (``skill_sdk.core``).
+знаний (``skill_sdk.core``). Подключения к внешним системам — ``ctx.connection(key)``:
+сведения из ядра, материал доступа из хранилища секретов (``skill_sdk.connections``).
 """
 
 from __future__ import annotations
 
 import contextvars
+import copy
 import logging
 import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 from skill_sdk import secrets
+from skill_sdk.connections import Connection, ConnectionClient, connections_for
 from skill_sdk.core import Artifacts, Core, Knowledge, core_for
 from skill_sdk.errors import SkillError
 from skill_sdk.pii import redact_messages
@@ -105,6 +110,22 @@ def _openai_llm() -> Any:
     return OpenAICompatibleClient(base_url=base_url, api_key=api_key, models=models)
 
 
+_NO_SETTINGS: Mapping[str, Any] = MappingProxyType({})
+
+
+def package_settings(raw: Any) -> Mapping[str, Any]:
+    """Значения настроек пакета из ``settings`` контекста вызова (CP-ADR-0081 В3).
+
+    Ядро отдаёт ``{package, version, schemaRevision, values}`` — ``values`` действующие
+    значения (сохранённые поверх ``default`` схемы) — или ``null``, если скилл не из
+    пакета или пакет настроек не объявляет. Не объект, нет ``values`` или ``values`` не
+    объект — настроек нет: пустое отображение. Копия только для чтения, своя на вызов."""
+    values = raw.get("values") if isinstance(raw, Mapping) else None
+    if not isinstance(values, Mapping) or not values:
+        return _NO_SETTINGS
+    return MappingProxyType(copy.deepcopy(dict(values)))
+
+
 @dataclass(frozen=True)
 class Invocation:
     """Метаданные вызова, которые передаёт хостинг."""
@@ -116,6 +137,8 @@ class Invocation:
     timeout_seconds: float | None = None
     # Проверенный контекст вызывающего (http/mcp с IAM) — TrustedAuthContext.
     caller: Any = None
+    # Значения настроек пакета скилла — ``package_settings`` от того, что прислало ядро.
+    settings: Mapping[str, Any] = _NO_SETTINGS
 
 
 @dataclass
@@ -195,6 +218,7 @@ class SkillContext:
         self._llm_usage = _LlmUsage()
         self._llm: _MeteredLlm | None = None
         self._core: Core | None = None
+        self._connections: ConnectionClient | None = None
         self.log = logging.LoggerAdapter(
             logger, {"skill": invocation.skill, "invocation_id": invocation.invocation_id}
         )
@@ -217,6 +241,13 @@ class SkillContext:
     @property
     def caller(self) -> Any:
         return self.invocation.caller
+
+    @property
+    def settings(self) -> Mapping[str, Any]:
+        """Действующие значения настроек пакета скилла (CP-ADR-0081): сохранённые
+        администратором поверх ``default`` схемы, только для чтения. Скилл не из пакета,
+        пакет без настроек или ядро их не передало — пустое отображение."""
+        return self.invocation.settings
 
     # -- время --
 
@@ -292,6 +323,17 @@ class SkillContext:
         """База знаний через ядро: ``preview``, ``apply``, ``document``, ``recall``, ``query``."""
         return self._core_access().knowledge
 
+    # -- подключения к внешним системам --
+
+    async def connection(self, key: str) -> Connection:
+        """Подключение по ключу из ``spec.connections`` агента: ``type``, ``account``,
+        ``settings`` и ``await access_token()`` (кэш не дольше 60 с). Ошибки —
+        ``connection_revoked``, ``connection_expired``, ``connection_not_found``,
+        ``connection_pending`` и повторяемый ``secret_store_unavailable``."""
+        if self._connections is None:
+            self._connections = connections_for(self, self._env)
+        return await self._connections.connection(key)
+
     def cost(self) -> dict[str, Any] | None:
         """Документ ``cost`` для ``:complete`` — ``None``, если учитывать нечего."""
         document: dict[str, Any] = {}
@@ -317,3 +359,6 @@ class SkillContext:
         if self._core is not None:
             core, self._core = self._core, None
             await core.aclose()
+        if self._connections is not None:
+            connections, self._connections = self._connections, None
+            await connections.aclose()
