@@ -1,6 +1,6 @@
 [project]
 name = "skill-sdk"
-version = "0.1.1"
+version = "0.2.1"
 description = "SDK скиллов платформы Taimen: контракт v1 из кода, контекст вызова, хостинг local/http/mcp, экспорт в пакет каталога (TAI-ADR-0045)"
 readme = "README.md"
 requires-python = ">=3.12"

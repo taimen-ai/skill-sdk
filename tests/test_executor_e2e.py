@@ -3,7 +3,8 @@
 Запускается там, где установлен control-plane (его окружение и суперпроект):
 
     cd services/control-plane && PYTHONPATH=../../sdk/skill-sdk/src:../../sdk/skill-sdk \
-        uv run pytest -q -c ../../sdk/skill-sdk/pyproject.toml ../../sdk/skill-sdk/tests/test_executor_e2e.py
+        uv run pytest -q -c ../../sdk/skill-sdk/pyproject.toml \
+        ../../sdk/skill-sdk/tests/test_executor_e2e.py
 
 В окружении самого skill-sdk исполнителя нет — тест пропускается.
 """

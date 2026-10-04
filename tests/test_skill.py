@@ -55,7 +55,9 @@ def test_implementation_is_chosen_at_export():
     }
 
 
-@pytest.mark.skipif(not CONTROL_PLANE.exists(), reason="control-plane не лежит в ../../services/control-plane")
+@pytest.mark.skipif(
+    not CONTROL_PLANE.exists(), reason="control-plane не лежит в ../../services/control-plane"
+)
 @pytest.mark.parametrize("target", [s.add, s.classify, s.echo, s.write, s.summarize])
 def test_contracts_pass_core_validators(target):
     sys.path.insert(0, str(CONTROL_PLANE))
